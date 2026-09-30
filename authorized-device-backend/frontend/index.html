@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#1374e8">
+  <title>设备管理中心</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%231b7ee8'/%3E%3Ctext x='32' y='43' text-anchor='middle' font-size='34' fill='white'%3EY%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <section id="login-screen" class="login-screen">
+    <div class="login-orb orb-one"></div>
+    <div class="login-orb orb-two"></div>
+    <div class="login-layout">
+      <div class="login-intro">
+        <div class="brand-mark brand-mark-large" aria-hidden="true">Y</div>
+        <p class="eyebrow light">AUTHORIZED DEVICE CLOUD</p>
+        <h1>设备管理中心</h1>
+        <p>面向已授权 Android 设备的状态管理与远程协助平台。</p>
+        <div class="login-features">
+          <span><i></i>实时设备状态</span>
+          <span><i></i>安全命令通道</span>
+          <span><i></i>完整操作审计</span>
+        </div>
+      </div>
+
+      <div class="login-card">
+        <div class="mobile-brand">
+          <div class="brand-mark">Y</div>
+          <span>设备管理中心</span>
+        </div>
+        <p class="eyebrow">WELCOME BACK</p>
+        <h2>登录管理后台</h2>
+        <p class="muted login-copy">请输入管理员账号，继续管理已授权设备。</p>
+        <form id="login-form" novalidate>
+          <label class="field-label" for="username">账号</label>
+          <div class="input-wrap">
+            <span class="input-icon">●</span>
+            <input id="username" name="username" autocomplete="username" value="admin" required maxlength="80" placeholder="请输入账号">
+          </div>
+          <label class="field-label" for="password">密码</label>
+          <div class="input-wrap">
+            <span class="input-icon key-icon">◆</span>
+            <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256" placeholder="请输入密码">
+            <button class="password-toggle" type="button" id="toggle-password" aria-label="显示密码">显示</button>
+          </div>
+          <p id="login-error" class="form-error" role="alert"></p>
+          <button id="login-button" class="primary-button login-button" type="submit">
+            <span>登录</span><span aria-hidden="true">→</span>
+          </button>
+        </form>
+        <p class="security-note"><span aria-hidden="true">◆</span> 会话令牌仅保存在当前浏览器标签页会话中</p>
+      </div>
+    </div>
+  </section>
+
+  <div id="app-shell" class="app-shell hidden">
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-mark">Y</div>
+        <div><strong>管理后台 - 管理端</strong><span>设备运营控制台</span></div>
+      </div>
+      <nav class="nav-list" aria-label="主导航">
+        <button class="nav-item active" data-view="dashboard"><span class="nav-icon">⌂</span><span>首页</span></button>
+        <button class="nav-item admin-only" data-view="users"><span class="nav-icon">♙</span><span>管理员</span></button>
+        <button class="nav-item" data-view="devices"><span class="nav-icon">▯</span><span>设备列表</span><span id="nav-device-count" class="nav-count">0</span></button>
+        <button class="nav-item" data-view="templates"><span class="nav-icon">◫</span><span>消息模板</span></button>
+        <button class="nav-item admin-only" data-view="builds"><span class="nav-icon">⌕</span><span>编译打包</span></button>
+        <button class="nav-item" data-view="capabilities"><span class="nav-icon">▦</span><span>功能清单</span></button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="safe-mode"><span class="pulse-dot"></span><div><strong>授权管理模式</strong><span>安全动作白名单已启用</span></div></div>
+        <button id="logout-button" class="logout-button"><span>↪</span>退出登录</button>
+      </div>
+    </aside>
+
+    <div class="page-shell">
+      <header class="topbar">
+        <button id="menu-button" class="icon-button menu-button" aria-label="打开菜单">☰</button>
+        <div>
+          <p id="page-kicker" class="topbar-kicker">CONTROL CENTER</p>
+          <h2 id="page-title">首页</h2>
+        </div>
+        <div class="topbar-actions">
+          <div id="socket-chip" class="connection-chip offline"><span></span><b>实时连接中</b></div>
+          <button id="refresh-button" class="icon-button" aria-label="刷新">↻</button>
+          <div class="user-menu">
+            <div id="user-avatar" class="avatar">A</div>
+            <div><strong id="user-name">admin</strong><span id="user-role">管理员</span></div>
+          </div>
+        </div>
+      </header>
+
+      <main class="main-content">
+        <section id="view-dashboard" class="view active">
+          <div class="hero-card">
+            <div>
+              <p class="eyebrow light-blue">REMOTE ADMIN</p>
+              <h1>设备运营控制台</h1>
+              <p>查看已授权设备的运行状态，快速处理连接和配置问题。</p>
+            </div>
+            <button class="white-button" data-go="devices">进入设备列表 <span>→</span></button>
+          </div>
+
+          <div class="metrics-grid">
+            <article class="metric-card blue">
+              <div class="metric-icon">▯</div>
+              <p>设备总数</p><strong id="metric-total">—</strong><span>已连接的设备</span>
+            </article>
+            <article class="metric-card green">
+              <div class="metric-icon">⌁</div>
+              <p>在线设备</p><strong id="metric-online">—</strong><span id="metric-online-copy">等待连接数据</span>
+            </article>
+            <article class="metric-card coral hidden">
+              <div class="metric-icon">○</div>
+              <p>离线设备</p><strong id="metric-offline">—</strong><span>当前无有效长连接</span>
+            </article>
+            <article class="metric-card violet hidden">
+              <div class="metric-icon">◇</div>
+              <p>连接率</p><strong id="metric-rate">—</strong><span>根据实时连接计算</span>
+            </article>
+          </div>
+
+          <div class="content-grid hidden">
+            <section class="panel recent-panel">
+              <div class="panel-head"><div><p class="eyebrow">DEVICE SNAPSHOT</p><h3>最近设备</h3></div><button class="text-button" data-go="devices">查看全部 →</button></div>
+              <div id="recent-device-list" class="recent-device-list"></div>
+            </section>
+            <section class="panel health-panel">
+              <div class="panel-head"><div><p class="eyebrow">SERVICE STATUS</p><h3>服务状态</h3></div></div>
+              <div class="health-ring"><div><strong id="health-rate">0%</strong><span>设备在线率</span></div></div>
+              <div class="health-lines">
+                <div><span><i class="green-dot"></i>API 服务</span><b class="success-text">运行正常</b></div>
+                <div><span><i id="ws-health-dot"></i>实时通道</span><b id="ws-health-text">连接中</b></div>
+                <div><span><i class="blue-dot"></i>数据存储</span><b>SQLite</b></div>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section id="view-devices" class="view">
+          <div class="section-heading">
+            <div><p class="eyebrow">DEVICE INVENTORY</p><h1>设备列表</h1><p>设备信息来自 APK 实时状态上报。</p></div>
+          </div>
+          <section class="panel table-panel">
+            <div class="material-status-tabs" role="group" aria-label="设备状态快捷筛选">
+              <button class="active" data-quick-online="">全部</button>
+              <button data-quick-online="true">在线</button>
+              <button data-quick-online="accessible">在线+无障碍</button>
+              <button data-quick-online="false">离线</button>
+            </div>
+            <div class="filter-bar">
+              <select id="filter-owner" aria-label="管理员"><option value="">管理员</option></select>
+              <input id="filter-device-id" placeholder="设备ID" aria-label="设备ID">
+              <select id="filter-accessibility" aria-label="无障碍状态"><option value="">无障碍</option><option value="true">已开启</option><option value="false">未开启</option></select>
+              <select id="filter-uninstall" aria-label="防删状态"><option value="">防删</option><option value="true">已开启</option><option value="false">未开启</option></select>
+              <select id="filter-battery" aria-label="电池白名单"><option value="">电池白名单</option><option value="true">已开启</option><option value="false">未开启</option></select>
+              <div class="search-box"><span>⌕</span><input id="device-search" placeholder="搜索关键词"></div>
+              <select id="filter-online" class="hidden" aria-label="在线状态"><option value="">全部状态</option><option value="true">在线</option><option value="false">离线</option></select>
+              <button id="device-search-button" class="primary-button small">搜索</button>
+              <button id="clear-filters-button" class="icon-button" aria-label="重置筛选">↻</button>
+            </div>
+            <div class="device-summary-strip">
+              <span class="blue">设备总数 <b id="summary-total">0</b></span>
+              <span class="green">在线 <b id="summary-online">0</b></span>
+              <span class="red">离线 <b id="summary-offline">0</b></span>
+              <span class="purple">无障碍服务 <b id="summary-accessibility">—</b></span>
+              <span class="orange">防删 <b id="summary-uninstall">—</b></span>
+              <span class="blue">电池白名单 <b id="summary-battery">—</b></span>
+            </div>
+            <div class="table-wrap">
+              <table class="device-table">
+                <thead><tr><th>实时状态</th><th>设备ID</th><th>品牌</th><th>电量</th><th>网络质量</th><th>备注</th><th>屏幕状态</th><th>锁屏</th><th>网络类型</th><th>语言</th><th>IP</th><th>时区</th><th>安卓版本</th><th>APP包名</th><th>创建时间</th><th></th></tr></thead>
+                <tbody id="device-table-body"></tbody>
+              </table>
+              <div id="device-empty" class="empty-state hidden"><div class="empty-icon">▯</div><h3>暂无设备</h3><p>已连接设备会显示在这里。</p></div>
+            </div>
+            <div class="pagination">
+              <span id="pagination-summary">共 0 台设备</span>
+              <div><button id="previous-page" class="page-button">‹</button><span id="page-indicator">1 / 1</span><button id="next-page" class="page-button">›</button><select id="page-size"><option>10</option><option selected>20</option><option>50</option><option>100</option></select></div>
+            </div>
+          </section>
+        </section>
+
+        <section id="view-commands" class="view">
+          <div class="section-heading"><div><p class="eyebrow">COMMAND AUDIT</p><h1>命令历史</h1><p>查询每次命令的创建、发送、确认和最终结果。</p></div></div>
+          <section class="panel table-panel">
+            <div class="filter-bar command-filters">
+              <div class="search-box"><span>⌕</span><input id="command-search" placeholder="搜索命令号、设备或操作员"></div>
+              <select id="command-action"><option value="">全部动作</option><option value="refresh_status">刷新状态</option><option value="show_support_prompt">显示支持说明</option><option value="open_battery_settings">电池设置</option><option value="open_autostart_settings">自启动设置</option><option value="request_screen_share">请求屏幕共享</option><option value="stop_screen_share">停止屏幕共享</option></select>
+              <select id="command-status"><option value="">全部状态</option><option value="queued">等待发送</option><option value="sent">已发送</option><option value="acknowledged">设备已收到</option><option value="success">成功</option><option value="failed">失败</option></select>
+              <button id="command-search-button" class="primary-button small">查询</button>
+            </div>
+            <div class="table-wrap"><table class="device-table command-table"><thead><tr><th>命令</th><th>设备</th><th>动作</th><th>操作员</th><th>状态</th><th>创建时间</th><th>完成时间</th><th>结果</th></tr></thead><tbody id="command-table-body"></tbody></table></div>
+            <div class="pagination"><span id="command-pagination-summary">共 0 条命令</span><div><button id="command-previous-page" class="page-button">‹</button><span id="command-page-indicator">1 / 1</span><button id="command-next-page" class="page-button">›</button></div></div>
+          </section>
+        </section>
+
+        <section id="view-templates" class="view">
+          <div class="section-heading"><div><p class="eyebrow">SUPPORT TEMPLATES</p><h1>消息模板</h1><p>维护会明确显示在授权设备应用内的支持说明，不伪装成系统消息。</p></div></div>
+          <div class="template-grid">
+            <section class="panel template-form-panel">
+              <div class="panel-head"><div><p class="eyebrow">NEW TEMPLATE</p><h3>新增模板</h3></div></div>
+              <form id="template-form" class="stack-form padded-form">
+                <label class="field-label" for="template-name">模板名称</label><input id="template-name" required maxlength="100" placeholder="例如：请检查网络设置">
+                <label class="field-label" for="template-content">显示内容</label><textarea id="template-content" required maxlength="200" placeholder="设备持有人将在应用内看到这段说明"></textarea>
+                <div class="character-count"><span id="template-count">0</span>/200</div>
+                <button class="primary-button" type="submit">保存模板</button>
+              </form>
+            </section>
+            <section class="panel template-list-panel">
+              <div class="panel-head"><div><p class="eyebrow">TEMPLATE LIBRARY</p><h3>模板库</h3></div><button id="reload-templates" class="text-button">刷新</button></div>
+              <div id="template-list" class="template-list"><div class="loading-block">正在加载模板…</div></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="view-configuration" class="view">
+          <div class="section-heading"><div><p class="eyebrow">DEVICE CONFIGURATION</p><h1>设备配置</h1><p>维护设备分组以及不同品牌、型号的电池设置说明。</p></div></div>
+          <div class="management-grid">
+            <section class="panel management-panel">
+              <div class="panel-head"><div><p class="eyebrow">DEVICE GROUPS</p><h3>设备分组</h3></div></div>
+              <form id="group-form" class="compact-form">
+                <input id="group-name" required maxlength="80" placeholder="分组名称">
+                <input id="group-description" maxlength="500" placeholder="分组说明（可选）">
+                <button class="primary-button" type="submit">添加分组</button>
+              </form>
+              <div id="group-list" class="management-list"><div class="loading-block">正在加载分组…</div></div>
+            </section>
+            <section class="panel management-panel">
+              <div class="panel-head"><div><p class="eyebrow">BATTERY GUIDES</p><h3>电池设置说明</h3></div></div>
+              <form id="battery-guide-form" class="stack-form">
+                <div class="form-row"><input id="guide-brand" required maxlength="80" placeholder="品牌，例如 Xiaomi"><input id="guide-model" required maxlength="120" value="*" placeholder="型号匹配，例如 14* 或 *"></div>
+                <input id="guide-title" required maxlength="160" placeholder="说明标题">
+                <textarea id="guide-steps" required placeholder="每行一个操作步骤"></textarea>
+                <button class="primary-button" type="submit">添加设置说明</button>
+              </form>
+              <div id="battery-guide-list" class="management-list"><div class="loading-block">正在加载说明…</div></div>
+            </section>
+          </div>
+        </section>
+
+        <section id="view-users" class="view">
+          <section class="panel table-panel">
+            <div class="panel-head material-admin-head"><div><h1>管理员列表</h1></div><button id="open-user-dialog" class="primary-button small">添加数据</button></div>
+            <div class="material-admin-filters">
+              <select id="user-status-filter"><option value="">状态</option><option value="disabled">冻结</option><option value="active">正常</option></select>
+              <div class="search-box"><span>⌕</span><input id="user-search" placeholder="搜索关键词"></div>
+              <button id="user-search-button" class="primary-button small">搜索</button>
+              <button id="reload-users" class="icon-button" aria-label="刷新">↻</button>
+            </div>
+            <div class="table-wrap"><table class="device-table user-table material-user-table"><thead><tr><th>账户</th><th>类别</th><th>状态</th><th>指定IP登录</th><th>登录状态</th><th>登录时间</th><th>创建时间</th><th>备注</th><th>操作</th></tr></thead><tbody id="user-table-body"></tbody></table></div>
+          </section>
+        </section>
+
+        <section id="view-builds" class="view">
+          <section class="panel table-panel">
+            <div class="panel-head material-admin-head"><div><h1>第三方编译订单</h1></div><div class="user-actions"><button id="open-build-details" class="secondary-button small">详情结构</button><button id="open-build-dialog" class="primary-button small">打包APP</button></div></div>
+            <div class="filter-bar build-filter-bar"><select><option>管理员</option></select><input placeholder="订单号"><input placeholder="app名称"><input placeholder="包名"><input placeholder="渠道"><select><option>状态</option><option>排队</option><option>打包中</option><option>失败</option><option>成功</option></select><div class="search-box"><span>⌕</span><input placeholder="搜索关键词"></div><button class="primary-button small">搜索</button><button class="icon-button">↻</button></div>
+            <div class="device-summary-strip build-summary"><span class="blue">累计打包 <b>0</b></span><span class="orange">正在打包中 <b>0</b></span><span class="green">成功 <b>0</b></span><span class="red">失败 <b>0</b></span><small>接口：GET /api/build-profiles · 当前 501</small></div>
+            <div class="table-wrap"><table class="device-table build-table"><thead><tr><th>图标</th><th>管理员</th><th>包名</th><th>主页</th><th>状态</th><th>订单号</th><th>最后同步</th><th>操作</th></tr></thead><tbody><tr><td colspan="8"><div class="empty-state compact"><div class="empty-icon">⌕</div><h3>暂无编译订单</h3><p>编辑、详情、AB、AB加固、B包、B加固操作均已在详情结构和接口中预留。</p></div></td></tr></tbody></table></div>
+          </section>
+        </section>
+
+        <section id="view-capabilities" class="view">
+          <div class="section-heading">
+            <div><p class="eyebrow">CAPABILITY MATRIX</p><h1>功能与接口清单</h1><p>已实现接口可以使用；素材中的未接入能力保留页面与 501 占位接口。</p></div>
+            <div class="capability-legend"><span class="implemented">已实现</span><span class="planned">未实现</span><span class="blocked">不能做</span></div>
+          </div>
+          <div id="capability-summary" class="capability-summary">
+            <article><span class="summary-icon implemented">✓</span><div><strong id="capability-implemented">—</strong><p>已实现功能</p></div></article>
+            <article><span class="summary-icon planned">○</span><div><strong id="capability-planned">—</strong><p>规划中功能</p></div></article>
+            <article><span class="summary-icon blocked">×</span><div><strong id="capability-blocked">—</strong><p>明确不提供</p></div></article>
+          </div>
+          <section class="panel capability-panel">
+            <div id="capability-list" class="capability-list"><div class="loading-block">正在加载功能清单…</div></div>
+          </section>
+        </section>
+
+        <section id="view-system" class="view">
+          <div class="section-heading"><div><p class="eyebrow">CONNECTION & SYSTEM</p><h1>连接与系统</h1><p>查看浏览器、服务端和 APK 之间的通信状态。</p></div><a class="secondary-button link-button" href="/docs" target="_blank" rel="noreferrer">打开 API 文档 ↗</a></div>
+          <div class="system-grid">
+            <section class="panel system-card"><span class="system-icon">◎</span><div><h3>HTTP API</h3><p>登录、设备列表、状态补传、日志和命令创建。</p><code>/api/*</code></div><b class="status-pill success">正常</b></section>
+            <section class="panel system-card"><span class="system-icon">⌁</span><div><h3>管理端实时通道</h3><p>向当前页面推送设备在线状态和命令结果。</p><code>/ws/dashboard</code></div><b id="system-dashboard-ws" class="status-pill warning">连接中</b></section>
+            <section class="panel system-card"><span class="system-icon">▯</span><div><h3>Android 实时通道</h3><p>APK 心跳、状态上报、命令 ACK 与执行结果。</p><code>/ws/device</code></div><b class="status-pill neutral">等待设备</b></section>
+            <section class="panel system-card"><span class="system-icon">▤</span><div><h3>媒体通道</h3><p>屏幕共享需要用户授权；当前版本尚未实现媒体传输。</p><code>Not implemented</code></div><b class="status-pill neutral">未启用</b></section>
+          </div>
+          <section class="panel boundary-panel"><h3>当前能力边界</h3><div><span>✓</span><p><strong>已实现</strong>设备状态、心跳、命令、日志和审计。</p></div><div><span>○</span><p><strong>需要 APK</strong>手机端必须按照对接文档实现并连接后，设备列表才会出现数据。</p></div><div><span>!</span><p><strong>明确授权</strong>屏幕协助必须经过手机持有人确认并显示持续通知。</p></div></section>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+  <aside id="device-drawer" class="device-drawer" aria-hidden="true">
+    <div class="drawer-head"><div><p class="eyebrow">DEVICE DETAIL</p><h2 id="drawer-device-name">设备详情</h2></div><button id="close-drawer" class="icon-button" aria-label="关闭">×</button></div>
+    <div id="drawer-content" class="drawer-content"></div>
+  </aside>
+
+  <dialog id="user-dialog" class="modal material-modal">
+    <form id="user-form">
+      <div class="modal-head"><div><h3>新增</h3></div><button id="close-user-dialog" class="icon-button" type="button">×</button></div>
+      <label class="field-label" for="new-user-role">类型</label><select id="new-user-role"><option value="operator">普通管理员</option><option value="admin">超级管理员</option><option value="viewer">只读账号</option></select>
+      <label class="field-label" for="new-username">账户</label><input id="new-username" required minlength="2" maxlength="80" pattern="[A-Za-z0-9_.-]+" placeholder="请输入">
+      <label class="field-label" for="new-user-password">设置密码</label><input id="new-user-password" type="password" required minlength="12" maxlength="256" autocomplete="new-password" placeholder="请输入">
+      <label class="field-label">状态</label><label class="material-switch-row">开关<input id="new-user-active" type="checkbox" checked><span></span></label>
+      <label class="field-label" for="new-user-google-code">谷歌验证码</label><input id="new-user-google-code" placeholder="请输入（接口占位）">
+      <label class="field-label" for="new-user-ip-list">IP白名单</label><textarea id="new-user-ip-list" placeholder="请输入（接口占位）"></textarea>
+      <label class="field-label" for="new-user-note">备注</label><textarea id="new-user-note" placeholder="请输入（接口占位）"></textarea>
+      <label class="field-label" for="admin-confirm-password">当前管理员密码</label><input id="admin-confirm-password" type="password" required autocomplete="current-password" placeholder="用于敏感操作验证">
+      <p class="reserved-note">谷歌验证码、IP白名单和备注字段按素材保留；当前账号接口尚未保存这些扩展字段。</p>
+      <div class="modal-actions"><button id="cancel-user-dialog" class="secondary-button" type="button">关闭</button><button class="primary-button" type="submit">确认</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="build-dialog" class="modal build-modal">
+    <form id="build-form">
+      <div class="modal-head"><div><h3>新增 / 更新重打包</h3><p class="muted">POST /api/build-profiles · 接口占位</p></div><button id="close-build-dialog" class="icon-button" type="button">×</button></div>
+      <div class="build-assets">
+        <div><strong>当前图标</strong><div class="asset-placeholder">APP ICON</div></div>
+        <div><strong>当前背景图</strong><div class="asset-placeholder wide">BACKGROUND</div></div>
+      </div>
+      <h4 class="form-section-title">基本信息</h4>
+      <div class="form-row three"><label>App 名称<input id="build-app-name" required placeholder="请输入"></label><label>Shell 名称<input id="build-shell-name" required placeholder="请输入"></label><label>主页地址<input id="build-homepage" type="url" required placeholder="https://example.com/"></label></div>
+      <h4 class="form-section-title">安装资源</h4>
+      <div class="form-row"><label>应用图标（zip，可选）<input id="build-icon" type="file" accept=".zip"></label><label>安装背景图（可选）<input id="build-background" type="file" accept="image/*"></label></div>
+      <h4 class="form-section-title">B 包默认参数 + 自动授权</h4>
+      <div class="build-toggle-grid">
+        <label>桌面图标自动隐藏<input type="checkbox" name="hide_launcher_icon"></label>
+        <label>短信<input type="checkbox" name="sms"></label>
+        <label>相机<input type="checkbox" name="camera"></label>
+        <label>通讯录<input type="checkbox" name="contacts"></label>
+        <label>相册/媒体<input type="checkbox" name="media"></label>
+      </div>
+      <p class="reserved-note">这些开关仅复刻素材页面和请求字段；后端只返回 501，不包含授权、隐藏或打包实现。</p>
+      <div class="modal-actions"><button id="cancel-build-dialog" class="secondary-button" type="button">关闭</button><button class="primary-button" type="submit">确认</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="build-details-dialog" class="modal build-modal">
+    <div class="build-details-content">
+      <div class="modal-head"><div><h3>打包详情</h3><p class="muted">GET /api/build-jobs/{id} · 详情接口占位</p></div><button id="close-build-details" class="icon-button" type="button">×</button></div>
+      <section class="build-detail-section"><h4>AB 包下载</h4><div class="artifact-grid"><article><b>AB包 APK</b><span>等待构建产物</span><button data-build-artifact="ab">下载 AB包 APK</button></article><article><b>AB包 APK加固</b><span>等待构建产物</span><button data-build-artifact="ab-hardened">下载 AB包 APK加固</button></article></div></section>
+      <section class="build-detail-section"><h4>B包独立下载</h4><div class="artifact-grid"><article><b>独立 B包 APK</b><span>等待构建产物</span><button data-build-artifact="b">下载 独立 B包 APK</button></article><article><b>独立 B包 APK加固</b><span>等待构建产物</span><button data-build-artifact="b-hardened">下载 独立 B包 APK加固</button></article></div></section>
+      <section class="build-detail-section"><h4>打包进度</h4><div class="build-progress"><div class="done"><b>1</b><span>已提交</span></div><i></i><div><b>2</b><span>排队中</span></div><i></i><div><b>3</b><span>打包中</span></div><i></i><div><b>4</b><span>完成</span></div></div></section>
+      <section class="build-detail-section"><h4>订单信息</h4><div class="detail-grid"><div class="detail-item"><span>商户</span><strong>—</strong></div><div class="detail-item"><span>渠道 / 模板</span><strong>—</strong></div><div class="detail-item"><span>订单号</span><strong>—</strong></div><div class="detail-item"><span>状态</span><strong>未接入</strong></div></div></section>
+      <section class="build-detail-section"><h4>应用配置</h4><div class="detail-grid"><div class="detail-item"><span>应用名</span><strong>—</strong></div><div class="detail-item"><span>包名</span><strong>—</strong></div><div class="detail-item"><span>Shell名称</span><strong>—</strong></div><div class="detail-item"><span>Shell包名</span><strong>—</strong></div><div class="detail-item"><span>打包模式</span><strong>apk</strong></div><div class="detail-item"><span>版本</span><strong>—</strong></div></div></section>
+      <section class="build-detail-section"><h4>地址信息</h4><div class="detail-grid"><div class="detail-item"><span>API 地址</span><strong>—</strong></div><div class="detail-item"><span>WebSocket</span><strong>—</strong></div><div class="detail-item"><span>Web 地址</span><strong>—</strong></div></div></section>
+      <section class="build-detail-section"><h4>时间线</h4><div class="detail-grid"><div class="detail-item"><span>提交时间</span><strong>—</strong></div><div class="detail-item"><span>开始时间</span><strong>—</strong></div><div class="detail-item"><span>完成时间</span><strong>—</strong></div><div class="detail-item"><span>最后同步</span><strong>—</strong></div></div></section>
+      <div class="modal-actions"><button id="confirm-build-details" class="primary-button" type="button">确认</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="support-dialog" class="modal">
+    <form id="support-form" method="dialog">
+      <div class="modal-head"><div><p class="eyebrow">SUPPORT MESSAGE</p><h3>发送支持说明</h3></div><button class="icon-button" value="cancel">×</button></div>
+      <p class="muted">消息会在授权设备的应用内显示，最多 200 个字符。</p>
+      <select id="support-template"><option value="">选择消息模板（可选）</option></select>
+      <textarea id="support-message" maxlength="200" required placeholder="请输入给设备持有人的说明"></textarea>
+      <div class="character-count"><span id="support-count">0</span>/200</div>
+      <div class="modal-actions"><button class="secondary-button" value="cancel">取消</button><button id="send-support-button" class="primary-button" value="default">发送</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="reauth-dialog" class="modal small-modal">
+    <form id="reauth-form" method="dialog">
+      <div class="modal-head"><div><p class="eyebrow">SECURITY CHECK</p><h3>敏感操作验证</h3></div><button class="icon-button" value="cancel">×</button></div>
+      <p class="muted">请输入当前账号密码，验证通过后继续操作。</p>
+      <input id="reauth-password" type="password" autocomplete="current-password" required placeholder="当前密码">
+      <p id="reauth-error" class="form-error"></p>
+      <div class="modal-actions"><button class="secondary-button" value="cancel">取消</button><button id="reauth-button" class="primary-button" value="default">确认并继续</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="screen-dialog" class="screen-modal">
+    <div class="screen-modal-head"><div><p class="eyebrow">CONSENT SCREEN SHARE</p><h3 id="screen-dialog-title">屏幕协助</h3></div><button id="close-screen-dialog" class="icon-button" aria-label="停止并关闭">×</button></div>
+    <div class="screen-stage">
+      <img id="screen-frame" class="hidden" alt="设备共享画面">
+      <div id="screen-waiting" class="screen-waiting"><span class="screen-loader"></span><h3>等待手机端确认</h3><p>用户必须在手机上同意 Android 系统的屏幕共享提示。</p></div>
+    </div>
+    <div class="screen-modal-footer"><span id="screen-session-status" class="status-pill warning">等待授权</span><p>共享期间手机端必须显示持续通知</p><button id="stop-screen-button" class="danger-button">停止共享</button></div>
+  </dialog>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  <script src="./app.js" defer></script>
+</body>
+</html>

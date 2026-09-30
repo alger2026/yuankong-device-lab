@@ -1,0 +1,41 @@
+# Local secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+*.keystore
+*.jks
+*.p12
+*.pem
+*.key
+
+# Python runtime and local data
+**/__pycache__/
+**/.pytest_cache/
+**/.venv/
+**/*.py[cod]
+**/data/
+**/*.sqlite3
+**/*.sqlite3-shm
+**/*.sqlite3-wal
+
+# Android/Gradle generated files
+**/.gradle/
+**/.idea/
+**/local.properties
+**/build/
+**/*.iml
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+*.log
+
+# Reference material and local verification output at the workspace root
+/*.mp4
+/*.zip
+/*.png
+/*.jpg
+/*.jpeg
+/*.md
+!/README.md
+

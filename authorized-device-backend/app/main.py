@@ -1,0 +1,2229 @@
+from __future__ import annotations
+
+import asyncio
+import fnmatch
+import json
+import sqlite3
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Annotated, Any
+
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+
+from .config import Settings
+from .db import Database
+from .realtime import DeviceConnection, RealtimeHub
+from .schemas import (
+    BatteryGuideRequest,
+    BuildProfileRequest,
+    CommandRequest,
+    DeviceGroupCreateRequest,
+    DeviceGroupUpdateRequest,
+    DeviceLogRequest,
+    DeviceSocketMessage,
+    DeviceStatusRequest,
+    DeviceUpdateRequest,
+    LoginRequest,
+    MessageTemplateCreateRequest,
+    MessageTemplateUpdateRequest,
+    PasswordChangeRequest,
+    ReauthRequest,
+    ReservedWorkbenchActionRequest,
+    ScreenSessionRequest,
+    UserCreateRequest,
+    UserUpdateRequest,
+)
+from .security import (
+    epoch_now,
+    hash_password,
+    random_token,
+    token_hash,
+    utc_now,
+    verify_password,
+)
+
+
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+
+CAPABILITY_CATALOG = [
+    {
+        "group": "管理端基础",
+        "name": "登录与当前账号",
+        "interfaces": ["POST /api/login", "GET /api/me", "POST /api/logout"],
+        "status": "implemented",
+        "note": "Bearer 会话、退出和当前用户信息。",
+    },
+    {
+        "group": "管理端基础",
+        "name": "角色与二次验证",
+        "interfaces": ["POST /api/auth/reauth"],
+        "status": "implemented",
+        "note": "admin/operator/viewer 角色和敏感操作二次验证。",
+    },
+    {
+        "group": "设备管理",
+        "name": "设备列表与状态",
+        "interfaces": ["GET /api/overview", "GET /api/devices", "GET /api/devices/{id}"],
+        "status": "implemented",
+        "note": "搜索、分页、在线状态和权限快照。",
+    },
+    {
+        "group": "实时通信",
+        "name": "管理页面实时通道",
+        "interfaces": ["POST /api/ws-ticket", "WS /ws/dashboard"],
+        "status": "implemented",
+        "note": "设备上线、离线、状态和命令结果推送。",
+    },
+    {
+        "group": "实时通信",
+        "name": "Android 实时通道",
+        "interfaces": ["POST /api/device/ws-ticket", "WS /ws/device"],
+        "status": "implemented",
+        "note": "设备心跳、状态、命令 ACK 和执行结果。",
+    },
+    {
+        "group": "设备操作",
+        "name": "安全动作命令",
+        "interfaces": ["POST /api/command", "GET /api/commands/{id}"],
+        "status": "implemented",
+        "note": "仅允许代码中定义的动作白名单。",
+    },
+    {
+        "group": "设备管理",
+        "name": "设备日志与审计",
+        "interfaces": ["POST /api/device/logs", "GET /api/devices/{id}/events"],
+        "status": "implemented",
+        "note": "幂等运行日志和管理操作审计。",
+    },
+    {
+        "group": "管理端基础",
+        "name": "后台账号管理",
+        "interfaces": ["GET/POST/PATCH /api/users", "GET /api/roles"],
+        "status": "implemented",
+        "note": "账号列表、新增、角色、状态、重置密码和会话撤销。",
+    },
+    {
+        "group": "设备管理",
+        "name": "设备分组与备注",
+        "interfaces": ["GET/POST /api/device-groups", "PATCH /api/devices/{id}"],
+        "status": "implemented",
+        "note": "设备分组、名称和备注维护。",
+    },
+    {
+        "group": "设备管理",
+        "name": "厂商电池设置说明",
+        "interfaces": ["GET /api/battery-config", "GET/POST/PUT /api/battery-guides"],
+        "status": "implemented",
+        "note": "按品牌和型号返回并维护用户可见的设置引导。",
+    },
+    {
+        "group": "设备操作",
+        "name": "完整命令历史",
+        "interfaces": ["GET /api/commands"],
+        "status": "implemented",
+        "note": "支持按设备、动作、状态、关键词筛选和分页。",
+    },
+    {
+        "group": "实时通信",
+        "name": "经用户授权的屏幕协助",
+        "interfaces": ["POST /api/screen-sessions", "WS /ws/screen"],
+        "status": "implemented",
+        "note": "后台会话和 JPEG/WebP 帧中继已完成；APK 必须使用 MediaProjection 系统确认。",
+    },
+    {
+        "group": "设备操作",
+        "name": "支持消息模板",
+        "interfaces": ["GET/POST/PATCH /api/message-templates"],
+        "status": "implemented",
+        "note": "维护最多 200 字符的用户可见支持说明，可用于 show_support_prompt。",
+    },
+    {
+        "group": "等待外部条件",
+        "name": "APK 编译、签名与产物上传",
+        "interfaces": ["GET/POST /api/build-profiles", "POST /api/build-jobs"],
+        "status": "not_implemented",
+        "note": "页面与 501 接口已预留；尚未接入源码、签名证书和隔离构建环境。",
+    },
+    {
+        "group": "不能做",
+        "name": "隐藏运行与隐藏图标",
+        "interfaces": ["POST /api/devices/{id}/workbench-actions/launcher-icon（501）"],
+        "status": "unavailable",
+        "note": "设备管理必须对设备持有人可见。",
+    },
+    {
+        "group": "不能做",
+        "name": "阻止卸载或规避用户关闭",
+        "interfaces": ["POST /api/devices/{id}/workbench-actions/uninstall-protection（501）"],
+        "status": "unavailable",
+        "note": "组织设备应使用 Android Enterprise 正式策略。",
+    },
+    {
+        "group": "不能做",
+        "name": "键盘记录与输入采集",
+        "interfaces": ["GET /api/devices/{id}/workbench/input-events（501）"],
+        "status": "unavailable",
+        "note": "不采集用户输入、密码、聊天内容或验证码。",
+    },
+    {
+        "group": "不能做",
+        "name": "凭据采集与假登录页",
+        "interfaces": ["GET /api/devices/{id}/workbench/credential-events（501）"],
+        "status": "unavailable",
+        "note": "不保存或重放 PIN、密码、图案和验证码。",
+    },
+    {
+        "group": "不能做",
+        "name": "静默屏幕或摄像头采集",
+        "interfaces": ["GET /api/devices/{id}/workbench/camera（501）"],
+        "status": "unavailable",
+        "note": "媒体协助必须经过用户明确授权并保持可见。",
+    },
+]
+
+
+RESERVED_WORKBENCH_MODULES = {
+    "messages",
+    "apps",
+    "system",
+    "permissions",
+    "gallery",
+    "contacts",
+    "files",
+    "clipboard",
+    "input-events",
+    "credential-events",
+    "camera",
+}
+
+RESERVED_WORKBENCH_ACTIONS = {
+    "unlock",
+    "translate",
+    "lock-screen",
+    "uninstall-protection",
+    "launcher-icon",
+    "power-menu",
+    "screenshot",
+    "front-camera",
+    "rear-camera",
+    "camera",
+    "open-app",
+    "uninstall-app",
+    "overlay-mode",
+}
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or Settings.from_env()
+    database = Database(settings.database_path)
+    hub = RealtimeHub()
+
+    async def mark_disconnected(
+        connection: DeviceConnection, reason: str, close_socket: bool = False
+    ) -> None:
+        removed = await hub.unregister_device(connection)
+        if not removed:
+            return
+        if close_socket:
+            try:
+                await connection.websocket.close(code=4000, reason=reason)
+            except RuntimeError:
+                pass
+        now = utc_now()
+
+        def update(conn: sqlite3.Connection) -> dict[str, Any] | None:
+            conn.execute(
+                "UPDATE device_sessions SET disconnected_at=?, disconnect_reason=? "
+                "WHERE id=? AND disconnected_at IS NULL",
+                (now, reason, connection.session_id),
+            )
+            conn.execute(
+                "UPDATE device_status SET online=0, updated_at=? WHERE device_id=?",
+                (now, connection.device_id),
+            )
+            return conn.execute(
+                "SELECT owner_user_id FROM devices WHERE id=?",
+                (connection.device_id,),
+            ).fetchone()
+
+        owner_row = database.transaction(update)
+        await hub.broadcast_dashboard(
+            {
+                "type": "device.offline",
+                "device_id": connection.device_id,
+                "reason": reason,
+                "time": now,
+            },
+            owner_row["owner_user_id"] if owner_row else None,
+        )
+
+    async def stale_connection_monitor() -> None:
+        interval = max(5, settings.device_offline_after_seconds // 3)
+        while True:
+            await asyncio.sleep(interval)
+            for connection in await hub.stale_connections(
+                settings.device_offline_after_seconds
+            ):
+                await mark_disconnected(connection, "heartbeat_timeout", close_socket=True)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        database.initialize(
+            settings.bootstrap_admin_username, settings.bootstrap_admin_password
+        )
+        monitor = asyncio.create_task(stale_connection_monitor())
+        try:
+            yield
+        finally:
+            monitor.cancel()
+            try:
+                await monitor
+            except asyncio.CancelledError:
+                pass
+
+    app = FastAPI(
+        title="Authorized Device Backend",
+        version="0.1.0",
+        description=(
+            "Consent-based Android device inventory and support backend. "
+            "Stealth, credential collection and anti-removal capabilities are excluded."
+        ),
+        lifespan=lifespan,
+    )
+    app.state.settings = settings
+    app.state.db = database
+    app.state.hub = hub
+
+    app.mount(
+        "/admin",
+        StaticFiles(directory=str(FRONTEND_DIR), html=True),
+        name="admin",
+    )
+
+    @app.get("/", include_in_schema=False)
+    def root():
+        return RedirectResponse(url="/admin/", status_code=307)
+
+    @app.middleware("http")
+    async def request_id_middleware(request: Request, call_next):
+        request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+        request.state.request_id = request_id
+        try:
+            response = await call_next(request)
+        except Exception:
+            raise
+        response.headers["X-Request-Id"] = request_id
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+    def envelope(request: Request, data: Any, status_code: int = 200) -> JSONResponse:
+        return JSONResponse(
+            {"data": data, "meta": {"request_id": request.state.request_id}},
+            status_code=status_code,
+        )
+
+    def bearer_token(authorization: str | None) -> str:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="missing bearer token")
+        token = authorization[7:].strip()
+        if not token:
+            raise HTTPException(status_code=401, detail="missing bearer token")
+        return token
+
+    def current_user(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        token = bearer_token(authorization)
+        row = database.one(
+            "SELECT s.id AS session_id,s.reauth_at_epoch,s.expires_at_epoch,s.revoked_at_epoch,"
+            "u.id,u.username,u.role,u.status FROM sessions s "
+            "JOIN users u ON u.id=s.user_id WHERE s.token_hash=?",
+            (token_hash(token),),
+        )
+        if (
+            row is None
+            or row["status"] != "active"
+            or row["revoked_at_epoch"] is not None
+            or row["expires_at_epoch"] < epoch_now()
+        ):
+            raise HTTPException(status_code=401, detail="invalid or expired session")
+        return row
+
+    def require_role(user: dict[str, Any], *roles: str) -> None:
+        if user["role"] not in roles:
+            raise HTTPException(status_code=403, detail="insufficient role")
+
+    def require_recent_reauth(user: dict[str, Any]) -> None:
+        reauth_at = user.get("reauth_at_epoch")
+        if reauth_at is None or epoch_now() - reauth_at > settings.reauth_ttl_seconds:
+            raise HTTPException(status_code=403, detail="recent reauthentication required")
+
+    def visible_device(device_id: str, user: dict[str, Any]) -> dict[str, Any]:
+        device = database.one("SELECT * FROM devices WHERE id=?", (device_id,))
+        if device is None:
+            raise HTTPException(status_code=404, detail="device not found")
+        if user["role"] != "admin" and device["owner_user_id"] != user["id"]:
+            raise HTTPException(status_code=404, detail="device not found")
+        return device
+
+    def reserved_not_implemented(feature: str) -> None:
+        """Keep the documented route contract without any device-side executor."""
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={
+                "code": "RESERVED_NOT_IMPLEMENTED",
+                "feature": feature,
+                "message": "接口已按参考素材预留，当前未实现执行逻辑",
+            },
+        )
+
+    def visible_screen_session(
+        session_id: str, user: dict[str, Any]
+    ) -> dict[str, Any]:
+        row = database.one(
+            "SELECT ss.*,d.owner_user_id,d.name AS device_name FROM screen_sessions ss "
+            "JOIN devices d ON d.id=ss.device_id WHERE ss.id=?",
+            (session_id,),
+        )
+        if row is None or (
+            user["role"] != "admin" and row["owner_user_id"] != user["id"]
+        ):
+            raise HTTPException(status_code=404, detail="screen session not found")
+        return row
+
+    def device_identity(
+        x_device_id: Annotated[str | None, Header()] = None,
+        x_device_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        if not x_device_id or not x_device_token:
+            raise HTTPException(status_code=401, detail="missing device credentials")
+        device = database.one("SELECT * FROM devices WHERE id=?", (x_device_id,))
+        if device is None or device["device_token_hash"] != token_hash(x_device_token):
+            raise HTTPException(status_code=401, detail="invalid device credentials")
+        return device
+
+    def validate_command_payload(action: str, payload: dict[str, Any]) -> None:
+        if action == "show_support_prompt":
+            if set(payload) - {"message"}:
+                raise HTTPException(status_code=400, detail="unknown support prompt field")
+            message = payload.get("message", "")
+            if not isinstance(message, str) or not 1 <= len(message) <= 200:
+                raise HTTPException(status_code=400, detail="message must be 1-200 characters")
+            return
+        if payload:
+            raise HTTPException(status_code=400, detail="this action accepts no payload")
+
+    def issue_screen_ticket(
+        conn: sqlite3.Connection, session_id: str, role: str
+    ) -> str:
+        ticket = random_token()
+        conn.execute(
+            "INSERT INTO screen_stream_tickets(id,ticket_hash,session_id,role,expires_at_epoch,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                str(uuid.uuid4()),
+                token_hash(ticket),
+                session_id,
+                role,
+                epoch_now() + settings.ws_ticket_ttl_seconds,
+                utc_now(),
+            ),
+        )
+        return ticket
+
+    @app.get("/api/health")
+    def health(request: Request):
+        return envelope(
+            request,
+            {
+                "status": "ok",
+                "version": "0.1.0",
+                "mode": "authorized-device-management",
+            },
+        )
+
+    @app.get("/api/capabilities")
+    def capabilities(
+        request: Request, user: dict[str, Any] = Depends(current_user)
+    ):
+        return envelope(
+            request,
+            {
+                "items": CAPABILITY_CATALOG,
+                "summary": {
+                    "implemented": sum(
+                        item["status"] == "implemented" for item in CAPABILITY_CATALOG
+                    ),
+                    "not_implemented": sum(
+                        item["status"] == "not_implemented"
+                        for item in CAPABILITY_CATALOG
+                    ),
+                    "unavailable": sum(
+                        item["status"] == "unavailable" for item in CAPABILITY_CATALOG
+                    ),
+                },
+            },
+        )
+
+    @app.get("/api/device/bootstrap")
+    def device_bootstrap(request: Request):
+        return envelope(
+            request,
+            {
+                "protocol_version": 1,
+                "ws_ticket_path": "/api/device/ws-ticket",
+                "ws_path": "/ws/device",
+                "heartbeat_interval_seconds": min(
+                    30, max(10, settings.device_offline_after_seconds // 3)
+                ),
+                "offline_after_seconds": settings.device_offline_after_seconds,
+                "allowed_actions": [
+                    "refresh_status",
+                    "show_support_prompt",
+                    "open_battery_settings",
+                    "open_autostart_settings",
+                    "request_screen_share",
+                    "stop_screen_share",
+                ]
+                + (["lock_device"] if settings.enable_device_lock else []),
+                "consent_required": ["request_screen_share"],
+            },
+        )
+
+    @app.post("/api/login")
+    def login(body: LoginRequest, request: Request):
+        user = database.one("SELECT * FROM users WHERE username=?", (body.username,))
+        if (
+            user is None
+            or user["status"] != "active"
+            or not verify_password(body.password, user["password_hash"])
+        ):
+            raise HTTPException(status_code=401, detail="invalid credentials")
+        token = random_token()
+        session_id = str(uuid.uuid4())
+        now_epoch = epoch_now()
+        database.execute(
+            "INSERT INTO sessions(id,user_id,token_hash,created_at_epoch,expires_at_epoch) "
+            "VALUES(?,?,?,?,?)",
+            (
+                session_id,
+                user["id"],
+                token_hash(token),
+                now_epoch,
+                now_epoch + settings.session_ttl_seconds,
+            ),
+        )
+        return envelope(
+            request,
+            {
+                "token": token,
+                "expires_in": settings.session_ttl_seconds,
+                "user": {
+                    "id": user["id"],
+                    "username": user["username"],
+                    "role": user["role"],
+                },
+            },
+        )
+
+    @app.get("/api/me")
+    def me(request: Request, user: dict[str, Any] = Depends(current_user)):
+        return envelope(
+            request,
+            {"id": user["id"], "username": user["username"], "role": user["role"]},
+        )
+
+    @app.post("/api/logout")
+    def logout(request: Request, user: dict[str, Any] = Depends(current_user)):
+        database.execute(
+            "UPDATE sessions SET revoked_at_epoch=? WHERE id=?",
+            (epoch_now(), user["session_id"]),
+        )
+        return envelope(request, {"logged_out": True})
+
+    @app.post("/api/auth/reauth")
+    def reauth(
+        body: ReauthRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        account = database.one("SELECT password_hash FROM users WHERE id=?", (user["id"],))
+        if account is None or not verify_password(body.password, account["password_hash"]):
+            raise HTTPException(status_code=401, detail="invalid credentials")
+        now_epoch = epoch_now()
+        database.execute(
+            "UPDATE sessions SET reauth_at_epoch=? WHERE id=?",
+            (now_epoch, user["session_id"]),
+        )
+        return envelope(request, {"reauthenticated": True, "valid_for": settings.reauth_ttl_seconds})
+
+    @app.post("/api/auth/password")
+    def change_password(
+        body: PasswordChangeRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        account = database.one("SELECT password_hash FROM users WHERE id=?", (user["id"],))
+        if account is None or not verify_password(
+            body.current_password, account["password_hash"]
+        ):
+            raise HTTPException(status_code=401, detail="invalid credentials")
+
+        def action(conn: sqlite3.Connection):
+            conn.execute(
+                "UPDATE users SET password_hash=? WHERE id=?",
+                (hash_password(body.new_password), user["id"]),
+            )
+            conn.execute(
+                "UPDATE sessions SET revoked_at_epoch=? WHERE user_id=? AND id<>? "
+                "AND revoked_at_epoch IS NULL",
+                (epoch_now(), user["id"], user["session_id"]),
+            )
+            Database.audit(
+                conn,
+                "user",
+                user["id"],
+                "user.password.change",
+                "user",
+                user["id"],
+                "success",
+            )
+
+        database.transaction(action)
+        return envelope(request, {"changed": True, "other_sessions_revoked": True})
+
+    @app.get("/api/roles")
+    def roles(request: Request, user: dict[str, Any] = Depends(current_user)):
+        require_role(user, "admin")
+        return envelope(
+            request,
+            [
+                {
+                    "id": "admin",
+                    "name": "超级管理员",
+                    "permissions": ["users:manage", "devices:all", "devices:control"],
+                },
+                {
+                    "id": "operator",
+                    "name": "操作员",
+                    "permissions": ["devices:own", "devices:control"],
+                },
+                {
+                    "id": "viewer",
+                    "name": "只读账号",
+                    "permissions": ["devices:own"],
+                },
+            ],
+        )
+
+    @app.get("/api/users")
+    def users(
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+        q: str = Query(default="", max_length=80),
+        role: str | None = Query(default=None, pattern="^(admin|operator|viewer)$"),
+        account_status: str | None = Query(
+            default=None, alias="status", pattern="^(active|disabled)$"
+        ),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+    ):
+        require_role(user, "admin")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if q:
+            clauses.append("u.username LIKE ?")
+            params.append(f"%{q}%")
+        if role:
+            clauses.append("u.role=?")
+            params.append(role)
+        if account_status:
+            clauses.append("u.status=?")
+            params.append(account_status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        total = database.one(
+            "SELECT count(*) AS value FROM users u" + where, tuple(params)
+        )["value"]
+        rows = database.all(
+            "SELECT u.id,u.username,u.role,u.status,u.created_at,"
+            "(SELECT max(s.created_at_epoch) FROM sessions s WHERE s.user_id=u.id) AS last_login_epoch,"
+            "(SELECT count(*) FROM devices d WHERE d.owner_user_id=u.id) AS device_count "
+            "FROM users u"
+            + where
+            + " ORDER BY u.created_at DESC LIMIT ? OFFSET ?",
+            tuple(params + [page_size, (page - 1) * page_size]),
+        )
+        return JSONResponse(
+            {
+                "data": rows,
+                "meta": {
+                    "request_id": request.state.request_id,
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                },
+            }
+        )
+
+    @app.post("/api/users")
+    def create_user(
+        body: UserCreateRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin")
+        require_recent_reauth(user)
+        user_id = str(uuid.uuid4())
+
+        def action(conn: sqlite3.Connection):
+            try:
+                conn.execute(
+                    "INSERT INTO users(id,username,password_hash,role,status,created_at) "
+                    "VALUES(?,?,?,?, 'active',?)",
+                    (
+                        user_id,
+                        body.username,
+                        hash_password(body.password),
+                        body.role,
+                        utc_now(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(status_code=409, detail="username already exists") from exc
+            Database.audit(
+                conn,
+                "user",
+                user["id"],
+                "user.create",
+                "user",
+                user_id,
+                "success",
+                {"username": body.username, "role": body.role},
+            )
+
+        database.transaction(action)
+        return envelope(
+            request,
+            {"id": user_id, "username": body.username, "role": body.role, "status": "active"},
+            201,
+        )
+
+    @app.patch("/api/users/{user_id}")
+    def update_user(
+        user_id: str,
+        body: UserUpdateRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin")
+        require_recent_reauth(user)
+        target = database.one("SELECT id,username,role,status FROM users WHERE id=?", (user_id,))
+        if target is None:
+            raise HTTPException(status_code=404, detail="user not found")
+        if target["id"] == user["id"] and (body.role is not None or body.status is not None):
+            raise HTTPException(status_code=400, detail="cannot change your own role or status")
+        removing_active_admin = (
+            target["role"] == "admin"
+            and target["status"] == "active"
+            and (body.role not in (None, "admin") or body.status == "disabled")
+        )
+        if removing_active_admin:
+            active_admins = database.one(
+                "SELECT count(*) AS value FROM users WHERE role='admin' AND status='active'"
+            )["value"]
+            if active_admins <= 1:
+                raise HTTPException(status_code=409, detail="at least one active admin is required")
+        updates: list[str] = []
+        params: list[Any] = []
+        if body.role is not None:
+            updates.append("role=?")
+            params.append(body.role)
+        if body.status is not None:
+            updates.append("status=?")
+            params.append(body.status)
+        if body.password is not None:
+            updates.append("password_hash=?")
+            params.append(hash_password(body.password))
+
+        def action(conn: sqlite3.Connection):
+            conn.execute(
+                "UPDATE users SET " + ",".join(updates) + " WHERE id=?",
+                tuple(params + [user_id]),
+            )
+            if body.status == "disabled" or body.password is not None:
+                conn.execute(
+                    "UPDATE sessions SET revoked_at_epoch=? WHERE user_id=? "
+                    "AND revoked_at_epoch IS NULL",
+                    (epoch_now(), user_id),
+                )
+            Database.audit(
+                conn,
+                "user",
+                user["id"],
+                "user.update",
+                "user",
+                user_id,
+                "success",
+                body.model_dump(exclude_none=True, exclude={"password"}),
+            )
+
+        database.transaction(action)
+        updated = database.one(
+            "SELECT id,username,role,status,created_at FROM users WHERE id=?", (user_id,)
+        )
+        return envelope(request, updated)
+
+    @app.post("/api/ws-ticket")
+    def dashboard_ws_ticket(
+        request: Request, user: dict[str, Any] = Depends(current_user)
+    ):
+        ticket = random_token()
+        database.execute(
+            "INSERT INTO ws_tickets(id,ticket_hash,purpose,subject_id,expires_at_epoch,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                str(uuid.uuid4()),
+                token_hash(ticket),
+                "dashboard",
+                user["id"],
+                epoch_now() + settings.ws_ticket_ttl_seconds,
+                utc_now(),
+            ),
+        )
+        return envelope(
+            request, {"ticket": ticket, "expires_in": settings.ws_ticket_ttl_seconds}
+        )
+
+    @app.delete("/api/users/{user_id}")
+    def delete_user_reserved(
+        user_id: str,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin")
+        # Reserved only: no account deletion logic is intentionally attached.
+        reserved_not_implemented(f"administrator deletion ({user_id})")
+
+    @app.patch("/api/users/{user_id}/settings")
+    def update_user_settings_reserved(
+        user_id: str,
+        body: dict[str, Any],
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin")
+        # Google verification, IP allow-list and remarks are contract placeholders.
+        reserved_not_implemented(f"administrator extended settings ({user_id})")
+
+    @app.get("/api/build-profiles")
+    def build_profiles_reserved(user: dict[str, Any] = Depends(current_user)):
+        require_role(user, "admin")
+        # Reserved only: no project discovery, compiler or signing process exists here.
+        reserved_not_implemented("APK build profiles")
+
+    @app.post("/api/build-profiles")
+    def create_build_profile_reserved(
+        body: BuildProfileRequest,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin")
+        reserved_not_implemented("APK build profile creation")
+
+    @app.patch("/api/build-profiles/{profile_id}")
+    def update_build_profile_reserved(
+        profile_id: str,
+        body: BuildProfileRequest,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin")
+        reserved_not_implemented(f"APK build profile update ({profile_id})")
+
+    @app.post("/api/build-jobs")
+    def create_build_job_reserved(
+        body: dict[str, Any],
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin")
+        # Deliberately no subprocess, Gradle, signer or uploaded-code execution.
+        reserved_not_implemented("APK build job")
+
+    @app.get("/api/build-jobs/{job_id}")
+    def build_job_reserved(
+        job_id: str,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin")
+        reserved_not_implemented(f"APK build job status ({job_id})")
+
+    @app.get("/api/build-artifacts/{artifact_id}/download")
+    def build_artifact_reserved(
+        artifact_id: str,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin")
+        reserved_not_implemented(f"APK build artifact ({artifact_id})")
+
+    @app.get("/api/device-groups")
+    def device_groups(
+        request: Request, user: dict[str, Any] = Depends(current_user)
+    ):
+        where = "" if user["role"] == "admin" else " WHERE g.owner_user_id=?"
+        params: tuple[Any, ...] = () if user["role"] == "admin" else (user["id"],)
+        rows = database.all(
+            "SELECT g.id,g.owner_user_id,g.name,g.description,g.created_at,g.updated_at,"
+            "count(d.id) AS device_count FROM device_groups g "
+            "LEFT JOIN devices d ON d.group_id=g.id"
+            + where
+            + " GROUP BY g.id ORDER BY g.name",
+            params,
+        )
+        return envelope(request, rows)
+
+    @app.post("/api/device-groups")
+    def create_device_group(
+        body: DeviceGroupCreateRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin", "operator")
+        group_id = str(uuid.uuid4())
+        now = utc_now()
+
+        def action(conn: sqlite3.Connection):
+            try:
+                conn.execute(
+                    "INSERT INTO device_groups(id,owner_user_id,name,description,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (group_id, user["id"], body.name, body.description, now, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(status_code=409, detail="group name already exists") from exc
+            Database.audit(
+                conn,
+                "user",
+                user["id"],
+                "device_group.create",
+                "device_group",
+                group_id,
+                "success",
+                {"name": body.name},
+            )
+
+        database.transaction(action)
+        return envelope(
+            request,
+            {
+                "id": group_id,
+                "owner_user_id": user["id"],
+                "name": body.name,
+                "description": body.description,
+                "device_count": 0,
+                "created_at": now,
+                "updated_at": now,
+            },
+            201,
+        )
+
+    @app.patch("/api/device-groups/{group_id}")
+    def update_device_group(
+        group_id: str,
+        body: DeviceGroupUpdateRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin", "operator")
+        group = database.one("SELECT * FROM device_groups WHERE id=?", (group_id,))
+        if group is None or (
+            user["role"] != "admin" and group["owner_user_id"] != user["id"]
+        ):
+            raise HTTPException(status_code=404, detail="device group not found")
+        updates: list[str] = []
+        params: list[Any] = []
+        if body.name is not None:
+            updates.append("name=?")
+            params.append(body.name)
+        if body.description is not None:
+            updates.append("description=?")
+            params.append(body.description)
+        updates.append("updated_at=?")
+        params.extend([utc_now(), group_id])
+        try:
+            database.execute(
+                "UPDATE device_groups SET " + ",".join(updates) + " WHERE id=?",
+                tuple(params),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="group name already exists") from exc
+        return envelope(
+            request, database.one("SELECT * FROM device_groups WHERE id=?", (group_id,))
+        )
+
+    @app.get("/api/battery-config")
+    def battery_config(
+        request: Request,
+        brand: str = Query(min_length=1, max_length=80),
+        model: str = Query(default="", max_length=120),
+    ):
+        guides = database.all(
+            "SELECT id,brand,model_pattern,title,steps_json,updated_at "
+            "FROM battery_guides WHERE enabled=1"
+        )
+        brand_value = brand.casefold()
+        model_value = model.casefold()
+
+        def guide_score(guide: dict[str, Any]) -> int:
+            guide_brand = guide["brand"].casefold()
+            pattern = guide["model_pattern"].casefold()
+            if guide_brand not in {"*", brand_value}:
+                return -1
+            if pattern != "*" and not fnmatch.fnmatchcase(model_value, pattern):
+                return -1
+            return (2 if guide_brand == brand_value else 0) + (1 if pattern != "*" else 0)
+
+        matched = [(guide_score(guide), guide) for guide in guides]
+        matched = [item for item in matched if item[0] >= 0]
+        if not matched:
+            raise HTTPException(status_code=404, detail="battery guide not found")
+        selected = max(matched, key=lambda item: item[0])[1]
+        selected["steps"] = json.loads(selected.pop("steps_json"))
+        return envelope(request, selected)
+
+    @app.get("/api/battery-guides")
+    def battery_guides(
+        request: Request, user: dict[str, Any] = Depends(current_user)
+    ):
+        rows = database.all(
+            "SELECT id,brand,model_pattern,title,steps_json,enabled,created_by,created_at,updated_at "
+            "FROM battery_guides ORDER BY brand,model_pattern"
+        )
+        for row in rows:
+            row["steps"] = json.loads(row.pop("steps_json"))
+        return envelope(request, rows)
+
+    @app.post("/api/battery-guides")
+    def create_battery_guide(
+        body: BatteryGuideRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin", "operator")
+        guide_id = str(uuid.uuid4())
+        now = utc_now()
+        try:
+            database.execute(
+                "INSERT INTO battery_guides(id,brand,model_pattern,title,steps_json,enabled,created_by,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    guide_id,
+                    body.brand,
+                    body.model_pattern,
+                    body.title,
+                    json.dumps(body.steps, ensure_ascii=False),
+                    int(body.enabled),
+                    user["id"],
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409, detail="battery guide already exists for brand and model"
+            ) from exc
+        return envelope(request, {"id": guide_id, **body.model_dump()}, 201)
+
+    @app.put("/api/battery-guides/{guide_id}")
+    def update_battery_guide(
+        guide_id: str,
+        body: BatteryGuideRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin", "operator")
+        if database.one("SELECT id FROM battery_guides WHERE id=?", (guide_id,)) is None:
+            raise HTTPException(status_code=404, detail="battery guide not found")
+        try:
+            database.execute(
+                "UPDATE battery_guides SET brand=?,model_pattern=?,title=?,steps_json=?,enabled=?,updated_at=? "
+                "WHERE id=?",
+                (
+                    body.brand,
+                    body.model_pattern,
+                    body.title,
+                    json.dumps(body.steps, ensure_ascii=False),
+                    int(body.enabled),
+                    utc_now(),
+                    guide_id,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409, detail="battery guide already exists for brand and model"
+            ) from exc
+        return envelope(request, {"id": guide_id, **body.model_dump()})
+
+    @app.get("/api/message-templates")
+    def message_templates(
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+        enabled: bool | None = None,
+    ):
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user["role"] != "admin":
+            clauses.append("mt.owner_user_id=?")
+            params.append(user["id"])
+        if enabled is not None:
+            clauses.append("mt.enabled=?")
+            params.append(int(enabled))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = database.all(
+            "SELECT mt.id,mt.owner_user_id,u.username AS owner_name,mt.name,mt.content,"
+            "mt.enabled,mt.created_at,mt.updated_at FROM message_templates mt "
+            "JOIN users u ON u.id=mt.owner_user_id"
+            + where
+            + " ORDER BY mt.updated_at DESC",
+            tuple(params),
+        )
+        return envelope(request, rows)
+
+    @app.post("/api/message-templates")
+    def create_message_template(
+        body: MessageTemplateCreateRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin", "operator")
+        template_id = str(uuid.uuid4())
+        now = utc_now()
+
+        def action(conn: sqlite3.Connection):
+            try:
+                conn.execute(
+                    "INSERT INTO message_templates(id,owner_user_id,name,content,enabled,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (
+                        template_id,
+                        user["id"],
+                        body.name,
+                        body.content,
+                        int(body.enabled),
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(status_code=409, detail="template name already exists") from exc
+            Database.audit(
+                conn,
+                "user",
+                user["id"],
+                "message_template.create",
+                "message_template",
+                template_id,
+                "success",
+                {"name": body.name},
+            )
+
+        database.transaction(action)
+        return envelope(
+            request,
+            {"id": template_id, "owner_user_id": user["id"], **body.model_dump()},
+            201,
+        )
+
+    @app.patch("/api/message-templates/{template_id}")
+    def update_message_template(
+        template_id: str,
+        body: MessageTemplateUpdateRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin", "operator")
+        template = database.one(
+            "SELECT * FROM message_templates WHERE id=?", (template_id,)
+        )
+        if template is None or (
+            user["role"] != "admin" and template["owner_user_id"] != user["id"]
+        ):
+            raise HTTPException(status_code=404, detail="message template not found")
+        updates: list[str] = []
+        params: list[Any] = []
+        for field in ("name", "content", "enabled"):
+            value = getattr(body, field)
+            if value is not None:
+                updates.append(f"{field}=?")
+                params.append(int(value) if isinstance(value, bool) else value)
+        updates.append("updated_at=?")
+        params.extend([utc_now(), template_id])
+        try:
+            database.execute(
+                "UPDATE message_templates SET " + ",".join(updates) + " WHERE id=?",
+                tuple(params),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="template name already exists") from exc
+        return envelope(
+            request,
+            database.one(
+                "SELECT id,owner_user_id,name,content,enabled,created_at,updated_at "
+                "FROM message_templates WHERE id=?",
+                (template_id,),
+            ),
+        )
+
+    @app.post("/api/device/ws-ticket")
+    def device_ws_ticket(
+        request: Request, device: dict[str, Any] = Depends(device_identity)
+    ):
+        ticket = random_token()
+        database.execute(
+            "INSERT INTO ws_tickets(id,ticket_hash,purpose,subject_id,expires_at_epoch,created_at) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                str(uuid.uuid4()),
+                token_hash(ticket),
+                "device",
+                device["id"],
+                epoch_now() + settings.ws_ticket_ttl_seconds,
+                utc_now(),
+            ),
+        )
+        return envelope(
+            request, {"ticket": ticket, "expires_in": settings.ws_ticket_ttl_seconds}
+        )
+
+    def update_device_status(device_id: str, body: DeviceStatusRequest) -> None:
+        values = body.model_dump(exclude_none=True)
+        reported_at = values.pop("reported_at", None) or utc_now()
+        allowed = {
+            "battery_percent",
+            "charging",
+            "network_type",
+            "network_quality",
+            "network_latency_ms",
+            "screen_state",
+            "locked",
+            "accessibility_enabled",
+            "battery_whitelist_enabled",
+            "device_admin_enabled",
+            "screen_permission_enabled",
+            "camera_permission_enabled",
+            "uninstall_protection_enabled",
+            "launcher_icon_visible",
+        }
+        values = {key: value for key, value in values.items() if key in allowed}
+        now = utc_now()
+        assignments = [f'"{key}"=?' for key in values]
+        params = [int(value) if isinstance(value, bool) else value for value in values.values()]
+        assignments.extend(["reported_at=?", "updated_at=?"])
+        params.extend([reported_at, now, device_id])
+        database.execute(
+            "UPDATE device_status SET " + ",".join(assignments) + " WHERE device_id=?",
+            tuple(params),
+        )
+        database.execute(
+            "UPDATE devices SET last_seen_at=?,updated_at=? WHERE id=?",
+            (now, now, device_id),
+        )
+
+    @app.post("/api/device/status")
+    async def device_status(
+        body: DeviceStatusRequest,
+        request: Request,
+        device: dict[str, Any] = Depends(device_identity),
+    ):
+        update_device_status(device["id"], body)
+        await hub.broadcast_dashboard(
+            {"type": "device.status", "device_id": device["id"], "status": body.model_dump(exclude_none=True)},
+            device["owner_user_id"],
+        )
+        return envelope(request, {"accepted": True})
+
+    @app.post("/api/device/logs")
+    def device_logs(
+        body: DeviceLogRequest,
+        request: Request,
+        device: dict[str, Any] = Depends(device_identity),
+    ):
+        try:
+            database.execute(
+                "INSERT INTO device_logs(device_id,event_uid,level,category,event,message,details_json,device_time,received_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    device["id"],
+                    body.event_uid,
+                    body.level,
+                    body.category,
+                    body.event,
+                    body.message,
+                    json.dumps(body.details, ensure_ascii=False),
+                    body.device_time,
+                    utc_now(),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            return envelope(request, {"accepted": True, "duplicate": True})
+        return envelope(request, {"accepted": True, "duplicate": False}, 202)
+
+    @app.get("/api/overview")
+    def overview(request: Request, user: dict[str, Any] = Depends(current_user)):
+        where = "" if user["role"] == "admin" else " WHERE d.owner_user_id=?"
+        params: tuple[Any, ...] = () if user["role"] == "admin" else (user["id"],)
+        total = database.one("SELECT count(*) AS value FROM devices d" + where, params)["value"]
+        online = database.one(
+            "SELECT count(*) AS value FROM devices d JOIN device_status s ON s.device_id=d.id"
+            + where
+            + (" AND" if where else " WHERE")
+            + " s.online=1",
+            params,
+        )["value"]
+        return envelope(request, {"total": total, "online": online, "offline": total - online})
+
+    @app.get("/api/devices")
+    def devices(
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+        q: str = Query(default="", max_length=120),
+        device_id: str = Query(default="", max_length=120),
+        owner_user_id: str | None = Query(default=None, max_length=80),
+        online: bool | None = None,
+        accessibility: bool | None = None,
+        uninstall_protection: bool | None = None,
+        battery_whitelist: bool | None = None,
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+    ):
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user["role"] != "admin":
+            clauses.append("d.owner_user_id=?")
+            params.append(user["id"])
+        elif owner_user_id:
+            clauses.append("d.owner_user_id=?")
+            params.append(owner_user_id)
+        if device_id:
+            clauses.append("d.id LIKE ?")
+            params.append(f"%{device_id}%")
+        if q:
+            clauses.append(
+                "(d.id LIKE ? OR d.name LIKE ? OR d.brand LIKE ? OR d.model LIKE ? "
+                "OR d.note LIKE ? OR g.name LIKE ?)"
+            )
+            term = f"%{q}%"
+            params.extend([term, term, term, term, term, term])
+        if online is not None:
+            clauses.append("s.online=?")
+            params.append(int(online))
+        if accessibility is not None:
+            clauses.append("s.accessibility_enabled=?")
+            params.append(int(accessibility))
+        if uninstall_protection is not None:
+            clauses.append("s.uninstall_protection_enabled=?")
+            params.append(int(uninstall_protection))
+        if battery_whitelist is not None:
+            clauses.append("s.battery_whitelist_enabled=?")
+            params.append(int(battery_whitelist))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        count = database.one(
+            "SELECT count(*) AS value FROM devices d JOIN device_status s ON s.device_id=d.id "
+            "LEFT JOIN device_groups g ON g.id=d.group_id"
+            + where,
+            tuple(params),
+        )["value"]
+        summary = database.one(
+            "SELECT count(*) AS total,"
+            "coalesce(sum(CASE WHEN s.online=1 THEN 1 ELSE 0 END),0) AS online,"
+            "coalesce(sum(CASE WHEN s.online=0 THEN 1 ELSE 0 END),0) AS offline,"
+            "coalesce(sum(CASE WHEN s.accessibility_enabled=1 THEN 1 ELSE 0 END),0) AS accessibility,"
+            "coalesce(sum(CASE WHEN s.uninstall_protection_enabled=1 THEN 1 ELSE 0 END),0) AS uninstall_protection,"
+            "coalesce(sum(CASE WHEN s.battery_whitelist_enabled=1 THEN 1 ELSE 0 END),0) AS battery_whitelist "
+            "FROM devices d JOIN device_status s ON s.device_id=d.id "
+            "LEFT JOIN device_groups g ON g.id=d.group_id"
+            + where,
+            tuple(params),
+        )
+        rows = database.all(
+            "SELECT d.id,d.name,d.brand,d.model,d.android_version,d.sdk_int,d.package_name,d.app_version,"
+            "d.locale,d.timezone,d.ip_address,d.created_at,"
+            "d.owner_user_id,d.group_id,d.note,d.last_seen_at,g.name AS group_name,s.* "
+            "FROM devices d JOIN device_status s ON s.device_id=d.id "
+            "LEFT JOIN device_groups g ON g.id=d.group_id"
+            + where
+            + " ORDER BY d.created_at DESC LIMIT ? OFFSET ?",
+            tuple(params + [page_size, (page - 1) * page_size]),
+        )
+        return JSONResponse(
+            {
+                "data": rows,
+                "meta": {
+                    "request_id": request.state.request_id,
+                    "page": page,
+                    "page_size": page_size,
+                    "total": count,
+                    "summary": summary,
+                },
+            }
+        )
+
+    @app.get("/api/devices/{device_id}")
+    def device_detail(
+        device_id: str,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        visible_device(device_id, user)
+        row = database.one(
+            "SELECT d.id,d.installation_id,d.owner_user_id,d.group_id,g.name AS group_name,d.name,d.note,"
+            "d.brand,d.model,d.android_version,"
+            "d.sdk_int,d.package_name,d.app_version,d.locale,d.timezone,d.ip_address,"
+            "d.first_seen_at,d.last_seen_at,d.created_at,d.updated_at,"
+            "s.online,s.battery_percent,s.charging,s.network_type,s.network_quality,s.network_latency_ms,"
+            "s.screen_state,s.locked,"
+            "s.accessibility_enabled,s.battery_whitelist_enabled,s.device_admin_enabled,"
+            "s.screen_permission_enabled,s.camera_permission_enabled,s.uninstall_protection_enabled,"
+            "s.launcher_icon_visible,s.reported_at,s.updated_at AS status_updated_at "
+            "FROM devices d JOIN device_status s ON s.device_id=d.id "
+            "LEFT JOIN device_groups g ON g.id=d.group_id WHERE d.id=?",
+            (device_id,),
+        )
+        return envelope(request, row)
+
+    @app.patch("/api/devices/{device_id}")
+    def update_device(
+        device_id: str,
+        body: DeviceUpdateRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        device = visible_device(device_id, user)
+        require_role(user, "admin", "operator")
+        group_id = None if body.clear_group else body.group_id
+        if body.group_id is not None:
+            group = database.one("SELECT * FROM device_groups WHERE id=?", (body.group_id,))
+            if group is None or (
+                user["role"] != "admin" and group["owner_user_id"] != user["id"]
+            ):
+                raise HTTPException(status_code=404, detail="device group not found")
+        updates: list[str] = []
+        params: list[Any] = []
+        if body.name is not None:
+            updates.append("name=?")
+            params.append(body.name)
+        if body.note is not None:
+            updates.append("note=?")
+            params.append(body.note)
+        if body.group_id is not None or body.clear_group:
+            updates.append("group_id=?")
+            params.append(group_id)
+        updates.append("updated_at=?")
+        params.extend([utc_now(), device["id"]])
+
+        def action(conn: sqlite3.Connection):
+            conn.execute(
+                "UPDATE devices SET " + ",".join(updates) + " WHERE id=?",
+                tuple(params),
+            )
+            Database.audit(
+                conn,
+                "user",
+                user["id"],
+                "device.update",
+                "device",
+                device["id"],
+                "success",
+                body.model_dump(exclude_none=True),
+            )
+
+        database.transaction(action)
+        return envelope(request, {"updated": True, "device_id": device["id"]})
+
+    @app.get("/api/devices/{device_id}/events")
+    def device_events(
+        device_id: str,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        visible_device(device_id, user)
+        rows = database.all(
+            "SELECT id,actor_type,actor_id,action,target_type,target_id,result,details_json,created_at "
+            "FROM audit_logs WHERE target_id=? ORDER BY id DESC LIMIT 200",
+            (device_id,),
+        )
+        for row in rows:
+            row["details"] = json.loads(row.pop("details_json"))
+        return envelope(request, rows)
+
+    @app.get("/api/devices/{device_id}/workbench/{module}")
+    def reserved_workbench_module(
+        device_id: str,
+        module: str,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        visible_device(device_id, user)
+        if module not in RESERVED_WORKBENCH_MODULES:
+            raise HTTPException(status_code=404, detail="workbench module not found")
+        # UI parity route only. There is no collection, storage or device reader behind it.
+        reserved_not_implemented(f"device workbench module: {module}")
+
+    @app.post("/api/devices/{device_id}/workbench-actions/{action}")
+    def reserved_workbench_action(
+        device_id: str,
+        action: str,
+        body: ReservedWorkbenchActionRequest,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        visible_device(device_id, user)
+        require_role(user, "admin", "operator")
+        if action not in RESERVED_WORKBENCH_ACTIONS:
+            raise HTTPException(status_code=404, detail="workbench action not found")
+        # Contract placeholder only: no command is queued or dispatched to the APK.
+        reserved_not_implemented(f"device workbench action: {action}")
+
+    @app.post("/api/command")
+    async def create_command(
+        body: CommandRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        device = visible_device(body.device_id, user)
+        require_role(user, "admin", "operator")
+        validate_command_payload(body.action, body.payload)
+        if body.action in {"request_screen_share", "lock_device"}:
+            require_recent_reauth(user)
+        if body.action == "lock_device":
+            require_role(user, "admin")
+            if not settings.enable_device_lock:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "device lock is disabled; enable only for Android Enterprise "
+                        "device-owner deployments with documented authorization"
+                    ),
+                )
+        command_id = str(uuid.uuid4())
+        now = utc_now()
+
+        def queue(conn: sqlite3.Connection):
+            conn.execute(
+                "INSERT INTO commands(id,device_id,operator_id,action,payload_json,status,queued_at) "
+                "VALUES(?,?,?,?,?,'queued',?)",
+                (
+                    command_id,
+                    device["id"],
+                    user["id"],
+                    body.action,
+                    json.dumps(body.payload, ensure_ascii=False),
+                    now,
+                ),
+            )
+            Database.audit(
+                conn,
+                "user",
+                user["id"],
+                "command.create",
+                "device",
+                device["id"],
+                "queued",
+                {"command_id": command_id, "action": body.action},
+            )
+
+        database.transaction(queue)
+        sent = await hub.send_command(
+            device["id"],
+            {
+                "type": "command.dispatch",
+                "message_id": str(uuid.uuid4()),
+                "correlation_id": command_id,
+                "payload": {"action": body.action, "parameters": body.payload},
+            },
+        )
+        if not sent:
+            database.execute(
+                "UPDATE commands SET status='failed',completed_at=?,error_code='DEVICE_OFFLINE',"
+                "error_message='device is not connected' WHERE id=?",
+                (utc_now(), command_id),
+            )
+            raise HTTPException(status_code=409, detail="device is offline")
+        database.execute(
+            "UPDATE commands SET status='sent',sent_at=? WHERE id=? AND status='queued'",
+            (utc_now(), command_id),
+        )
+        return envelope(
+            request, {"command_id": command_id, "status": "sent"}, 202
+        )
+
+    @app.get("/api/commands")
+    def commands(
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+        device_id: str | None = Query(default=None, max_length=80),
+        action: str | None = Query(default=None, max_length=80),
+        command_status: str | None = Query(
+            default=None,
+            alias="status",
+            pattern="^(queued|sent|acknowledged|success|failed)$",
+        ),
+        q: str = Query(default="", max_length=120),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+    ):
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user["role"] != "admin":
+            clauses.append("d.owner_user_id=?")
+            params.append(user["id"])
+        if device_id:
+            visible_device(device_id, user)
+            clauses.append("c.device_id=?")
+            params.append(device_id)
+        if action:
+            clauses.append("c.action=?")
+            params.append(action)
+        if command_status:
+            clauses.append("c.status=?")
+            params.append(command_status)
+        if q:
+            clauses.append("(c.id LIKE ? OR d.name LIKE ? OR u.username LIKE ?)")
+            term = f"%{q}%"
+            params.extend([term, term, term])
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        base = (
+            " FROM commands c JOIN devices d ON d.id=c.device_id "
+            "JOIN users u ON u.id=c.operator_id"
+        )
+        total = database.one("SELECT count(*) AS value" + base + where, tuple(params))[
+            "value"
+        ]
+        rows = database.all(
+            "SELECT c.id,c.device_id,d.name AS device_name,c.operator_id,u.username AS operator_name,"
+            "c.action,c.payload_json,c.status,c.queued_at,c.sent_at,c.acknowledged_at,c.completed_at,"
+            "c.error_code,c.error_message,c.result_json"
+            + base
+            + where
+            + " ORDER BY c.queued_at DESC LIMIT ? OFFSET ?",
+            tuple(params + [page_size, (page - 1) * page_size]),
+        )
+        for row in rows:
+            row["payload"] = json.loads(row.pop("payload_json"))
+            raw_result = row.pop("result_json")
+            row["result"] = json.loads(raw_result) if raw_result else None
+        return JSONResponse(
+            {
+                "data": rows,
+                "meta": {
+                    "request_id": request.state.request_id,
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                },
+            }
+        )
+
+    @app.get("/api/commands/{command_id}")
+    def command_detail(
+        command_id: str,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        row = database.one("SELECT * FROM commands WHERE id=?", (command_id,))
+        if row is None:
+            raise HTTPException(status_code=404, detail="command not found")
+        visible_device(row["device_id"], user)
+        row["payload"] = json.loads(row.pop("payload_json"))
+        row["result"] = json.loads(row.pop("result_json")) if row["result_json"] else None
+        return envelope(request, row)
+
+    @app.get("/api/screen-sessions")
+    def screen_sessions(
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+        device_id: str | None = Query(default=None, max_length=80),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=20, ge=1, le=100),
+    ):
+        clauses: list[str] = []
+        params: list[Any] = []
+        if user["role"] != "admin":
+            clauses.append("d.owner_user_id=?")
+            params.append(user["id"])
+        if device_id:
+            visible_device(device_id, user)
+            clauses.append("ss.device_id=?")
+            params.append(device_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        base = " FROM screen_sessions ss JOIN devices d ON d.id=ss.device_id"
+        total = database.one("SELECT count(*) AS value" + base + where, tuple(params))[
+            "value"
+        ]
+        rows = database.all(
+            "SELECT ss.id,ss.device_id,d.name AS device_name,ss.operator_id,ss.command_id,ss.status,"
+            "ss.requested_at,ss.consented_at,ss.ended_at,ss.error_code,ss.error_message"
+            + base
+            + where
+            + " ORDER BY ss.requested_at DESC LIMIT ? OFFSET ?",
+            tuple(params + [page_size, (page - 1) * page_size]),
+        )
+        return JSONResponse(
+            {
+                "data": rows,
+                "meta": {
+                    "request_id": request.state.request_id,
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                },
+            }
+        )
+
+    @app.post("/api/screen-sessions")
+    async def create_screen_session(
+        body: ScreenSessionRequest,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin", "operator")
+        require_recent_reauth(user)
+        device = visible_device(body.device_id, user)
+        if not await hub.is_online(device["id"]):
+            raise HTTPException(status_code=409, detail="device is offline")
+        session_id = str(uuid.uuid4())
+        command_id = str(uuid.uuid4())
+        now = utc_now()
+        browser_ticket = ""
+        device_ticket = ""
+
+        def action(conn: sqlite3.Connection):
+            nonlocal browser_ticket, device_ticket
+            conn.execute(
+                "INSERT INTO commands(id,device_id,operator_id,action,payload_json,status,queued_at) "
+                "VALUES(?,?,?,?,?,'queued',?)",
+                (
+                    command_id,
+                    device["id"],
+                    user["id"],
+                    "request_screen_share",
+                    "{}",
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO screen_sessions(id,device_id,operator_id,command_id,status,requested_at) "
+                "VALUES(?,?,?,?, 'requesting',?)",
+                (session_id, device["id"], user["id"], command_id, now),
+            )
+            browser_ticket = issue_screen_ticket(conn, session_id, "browser")
+            device_ticket = issue_screen_ticket(conn, session_id, "device")
+            payload = {
+                "session_id": session_id,
+                "device_media_ticket": device_ticket,
+                "media_ws_path": "/ws/screen",
+                "frame_protocol": "one-jpeg-or-webp-image-per-binary-message",
+                "consent_required": True,
+            }
+            conn.execute(
+                "UPDATE commands SET payload_json=? WHERE id=?",
+                (json.dumps(payload, ensure_ascii=False), command_id),
+            )
+            Database.audit(
+                conn,
+                "user",
+                user["id"],
+                "screen_session.create",
+                "device",
+                device["id"],
+                "requesting",
+                {"session_id": session_id, "command_id": command_id},
+            )
+
+        database.transaction(action)
+        sent = await hub.send_command(
+            device["id"],
+            {
+                "type": "command.dispatch",
+                "message_id": str(uuid.uuid4()),
+                "correlation_id": command_id,
+                "payload": {
+                    "action": "request_screen_share",
+                    "parameters": {
+                        "session_id": session_id,
+                        "device_media_ticket": device_ticket,
+                        "media_ws_path": "/ws/screen",
+                        "frame_protocol": "one-jpeg-or-webp-image-per-binary-message",
+                        "consent_required": True,
+                    },
+                },
+            },
+        )
+        if not sent:
+            database.execute(
+                "UPDATE screen_sessions SET status='failed',ended_at=?,error_code='DEVICE_OFFLINE',"
+                "error_message='device disconnected before command dispatch' WHERE id=?",
+                (utc_now(), session_id),
+            )
+            database.execute(
+                "UPDATE commands SET status='failed',completed_at=?,error_code='DEVICE_OFFLINE',"
+                "error_message='device is not connected' WHERE id=?",
+                (utc_now(), command_id),
+            )
+            raise HTTPException(status_code=409, detail="device is offline")
+        database.execute(
+            "UPDATE commands SET status='sent',sent_at=? WHERE id=? AND status='queued'",
+            (utc_now(), command_id),
+        )
+        database.execute(
+            "UPDATE screen_sessions SET status='awaiting_consent' WHERE id=?",
+            (session_id,),
+        )
+        return envelope(
+            request,
+            {
+                "id": session_id,
+                "device_id": device["id"],
+                "command_id": command_id,
+                "status": "awaiting_consent",
+                "browser_ticket": browser_ticket,
+                "ws_path": "/ws/screen",
+                "ticket_expires_in": settings.ws_ticket_ttl_seconds,
+                "frame_protocol": "one-jpeg-or-webp-image-per-binary-message",
+            },
+            201,
+        )
+
+    @app.get("/api/screen-sessions/{session_id}")
+    def screen_session_detail(
+        session_id: str,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        return envelope(request, visible_screen_session(session_id, user))
+
+    @app.post("/api/screen-sessions/{session_id}/stop")
+    async def stop_screen_session(
+        session_id: str,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        require_role(user, "admin", "operator")
+        session = visible_screen_session(session_id, user)
+        await hub.send_command(
+            session["device_id"],
+            {
+                "type": "command.dispatch",
+                "message_id": str(uuid.uuid4()),
+                "correlation_id": session["command_id"],
+                "payload": {
+                    "action": "stop_screen_share",
+                    "parameters": {"session_id": session_id},
+                },
+            },
+        )
+        await hub.notify_screen_peer(
+            session_id,
+            "device",
+            {"type": "screen.stop", "payload": {"reason": "operator_stopped"}},
+        )
+        database.execute(
+            "UPDATE screen_sessions SET status='stopped',ended_at=? "
+            "WHERE id=? AND status NOT IN ('stopped','denied','failed')",
+            (utc_now(), session_id),
+        )
+        await hub.broadcast_dashboard(
+            {
+                "type": "screen.session.updated",
+                "session_id": session_id,
+                "device_id": session["device_id"],
+                "status": "stopped",
+            },
+            session["owner_user_id"],
+        )
+        return envelope(request, {"id": session_id, "status": "stopped"})
+
+    @app.websocket("/ws/screen")
+    async def screen_websocket(websocket: WebSocket, ticket: str = Query()):
+        ticket_row = database.consume_screen_ticket(ticket)
+        if ticket_row is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        session = database.one(
+            "SELECT ss.*,d.owner_user_id FROM screen_sessions ss "
+            "JOIN devices d ON d.id=ss.device_id WHERE ss.id=?",
+            (ticket_row["session_id"],),
+        )
+        if session is None or session["status"] in {"denied", "stopped", "failed", "expired"}:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        await websocket.accept()
+        role = ticket_row["role"]
+        connection, _ = await hub.register_screen(session["id"], role, websocket)
+        if role == "device":
+            now = utc_now()
+            database.execute(
+                "UPDATE screen_sessions SET status='active',consented_at=coalesce(consented_at,?) "
+                "WHERE id=?",
+                (now, session["id"]),
+            )
+            await hub.broadcast_dashboard(
+                {
+                    "type": "screen.session.updated",
+                    "session_id": session["id"],
+                    "device_id": session["device_id"],
+                    "status": "active",
+                },
+                session["owner_user_id"],
+            )
+        await websocket.send_json(
+            {
+                "type": "server.hello",
+                "payload": {
+                    "session_id": session["id"],
+                    "role": role,
+                    "frame_protocol": "one-jpeg-or-webp-image-per-binary-message",
+                    "max_frame_bytes": 2_000_000,
+                },
+            }
+        )
+        try:
+            while True:
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    break
+                frame = message.get("bytes")
+                text_message = message.get("text")
+                if frame is not None and role == "device":
+                    if len(frame) > 2_000_000:
+                        await websocket.send_json(
+                            {"type": "server.error", "payload": {"code": "FRAME_TOO_LARGE"}}
+                        )
+                        continue
+                    await hub.relay_screen_frame(session["id"], frame)
+                elif text_message:
+                    try:
+                        payload = json.loads(text_message)
+                    except ValueError:
+                        continue
+                    if payload.get("type") == "client.ping":
+                        await websocket.send_json({"type": "server.pong", "time": utc_now()})
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            removed = await hub.unregister_screen(connection)
+            if removed and role in {"browser", "device"}:
+                reason = "browser_disconnected" if role == "browser" else "device_disconnected"
+                database.execute(
+                    "UPDATE screen_sessions SET status='stopped',ended_at=?,error_code=? "
+                    "WHERE id=? AND status IN ('requesting','awaiting_consent','active')",
+                    (utc_now(), reason.upper(), session["id"]),
+                )
+                peer = "device" if role == "browser" else "browser"
+                await hub.notify_screen_peer(
+                    session["id"],
+                    peer,
+                    {"type": "screen.stop", "payload": {"reason": reason}},
+                )
+                if role == "browser":
+                    await hub.send_command(
+                        session["device_id"],
+                        {
+                            "type": "command.dispatch",
+                            "message_id": str(uuid.uuid4()),
+                            "correlation_id": session["command_id"],
+                            "payload": {
+                                "action": "stop_screen_share",
+                                "parameters": {"session_id": session["id"]},
+                            },
+                        },
+                    )
+                await hub.broadcast_dashboard(
+                    {
+                        "type": "screen.session.updated",
+                        "session_id": session["id"],
+                        "device_id": session["device_id"],
+                        "status": "stopped",
+                        "reason": reason,
+                    },
+                    session["owner_user_id"],
+                )
+
+    @app.websocket("/ws/dashboard")
+    async def dashboard_websocket(websocket: WebSocket, ticket: str = Query()):
+        ticket_row = database.consume_ticket(ticket, "dashboard")
+        if ticket_row is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        user = database.one("SELECT id,role,status FROM users WHERE id=?", (ticket_row["subject_id"],))
+        if user is None or user["status"] != "active":
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        await websocket.accept()
+        connection_id = await hub.register_dashboard(websocket, user["id"], user["role"])
+        await websocket.send_json({"type": "server.hello", "time": utc_now()})
+        try:
+            while True:
+                message = await websocket.receive_json()
+                if message.get("type") == "client.ping":
+                    await websocket.send_json({"type": "server.pong", "time": utc_now()})
+        except (WebSocketDisconnect, ValueError):
+            pass
+        finally:
+            await hub.unregister_dashboard(connection_id)
+
+    async def handle_status_message(
+        connection: DeviceConnection,
+        device: dict[str, Any],
+        message: DeviceSocketMessage,
+    ) -> None:
+        try:
+            status_body = DeviceStatusRequest.model_validate(message.payload)
+        except ValueError:
+            await connection.websocket.send_json(
+                {
+                    "type": "server.error",
+                    "correlation_id": message.message_id,
+                    "payload": {"code": "INVALID_STATUS"},
+                }
+            )
+            return
+        update_device_status(device["id"], status_body)
+        await hub.broadcast_dashboard(
+            {
+                "type": "device.status",
+                "device_id": device["id"],
+                "status": status_body.model_dump(exclude_none=True),
+            },
+            device["owner_user_id"],
+        )
+
+    async def handle_command_message(
+        connection: DeviceConnection,
+        device: dict[str, Any],
+        message: DeviceSocketMessage,
+    ) -> None:
+        command_id = message.correlation_id
+        if not command_id:
+            return
+        command = database.one(
+            "SELECT * FROM commands WHERE id=? AND device_id=?",
+            (command_id, device["id"]),
+        )
+        if command is None:
+            await connection.websocket.send_json(
+                {
+                    "type": "server.error",
+                    "correlation_id": message.message_id,
+                    "payload": {"code": "UNKNOWN_COMMAND"},
+                }
+            )
+            return
+        if message.type == "command.ack":
+            database.execute(
+                "UPDATE commands SET status='acknowledged',acknowledged_at=? "
+                "WHERE id=? AND status IN ('sent','queued')",
+                (utc_now(), command_id),
+            )
+            status_value = "acknowledged"
+        else:
+            success = message.payload.get("success") is True
+            result = message.payload.get("result", {})
+            error_code = None if success else str(message.payload.get("error_code", "DEVICE_ERROR"))[:80]
+            error_message = None if success else str(message.payload.get("error_message", "command failed"))[:500]
+            database.execute(
+                "UPDATE commands SET status=?,completed_at=?,error_code=?,error_message=?,result_json=? WHERE id=?",
+                (
+                    "success" if success else "failed",
+                    utc_now(),
+                    error_code,
+                    error_message,
+                    json.dumps(result, ensure_ascii=False),
+                    command_id,
+                ),
+            )
+            status_value = "success" if success else "failed"
+        await hub.broadcast_dashboard(
+            {
+                "type": "command.updated",
+                "device_id": device["id"],
+                "command_id": command_id,
+                "status": status_value,
+            },
+            device["owner_user_id"],
+        )
+
+    async def handle_screen_status_message(
+        connection: DeviceConnection,
+        device: dict[str, Any],
+        message: DeviceSocketMessage,
+    ) -> None:
+        session_id = message.payload.get("session_id")
+        reported_status = message.payload.get("status")
+        status_map = {
+            "consent_required": "awaiting_consent",
+            "active": "active",
+            "denied": "denied",
+            "stopped": "stopped",
+            "failed": "failed",
+        }
+        if not isinstance(session_id, str) or reported_status not in status_map:
+            await connection.websocket.send_json(
+                {
+                    "type": "server.error",
+                    "correlation_id": message.message_id,
+                    "payload": {"code": "INVALID_SCREEN_STATUS"},
+                }
+            )
+            return
+        session = database.one(
+            "SELECT id FROM screen_sessions WHERE id=? AND device_id=?",
+            (session_id, device["id"]),
+        )
+        if session is None:
+            await connection.websocket.send_json(
+                {
+                    "type": "server.error",
+                    "correlation_id": message.message_id,
+                    "payload": {"code": "UNKNOWN_SCREEN_SESSION"},
+                }
+            )
+            return
+        stored_status = status_map[reported_status]
+        now = utc_now()
+        consented_at = now if stored_status == "active" else None
+        ended_at = now if stored_status in {"denied", "stopped", "failed"} else None
+        error_code = message.payload.get("error_code") if stored_status == "failed" else None
+        error_message = (
+            str(message.payload.get("error_message", ""))[:500]
+            if stored_status == "failed"
+            else None
+        )
+        database.execute(
+            "UPDATE screen_sessions SET status=?,consented_at=coalesce(?,consented_at),"
+            "ended_at=?,error_code=?,error_message=? WHERE id=?",
+            (
+                stored_status,
+                consented_at,
+                ended_at,
+                str(error_code)[:80] if error_code else None,
+                error_message,
+                session_id,
+            ),
+        )
+        event = {
+            "type": "screen.session.updated",
+            "session_id": session_id,
+            "device_id": device["id"],
+            "status": stored_status,
+        }
+        await hub.broadcast_dashboard(event, device["owner_user_id"])
+        await hub.notify_screen_peer(session_id, "browser", event)
+
+    @app.websocket("/ws/device")
+    async def device_websocket(websocket: WebSocket, ticket: str = Query()):
+        ticket_row = database.consume_ticket(ticket, "device")
+        if ticket_row is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        device = database.one("SELECT * FROM devices WHERE id=?", (ticket_row["subject_id"],))
+        if device is None:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        await websocket.accept()
+        session_id = str(uuid.uuid4())
+        connection, previous = await hub.register_device(
+            device["id"], websocket, session_id
+        )
+        now = utc_now()
+
+        def connect_device(conn: sqlite3.Connection):
+            if previous is not None:
+                conn.execute(
+                    "UPDATE device_sessions SET disconnected_at=?, "
+                    "disconnect_reason='replaced_by_new_session' "
+                    "WHERE id=? AND disconnected_at IS NULL",
+                    (now, previous.session_id),
+                )
+            conn.execute(
+                "INSERT INTO device_sessions(id,device_id,socket_id,connected_at,last_heartbeat_at) "
+                "VALUES(?,?,?,?,?)",
+                (session_id, device["id"], connection.socket_id, now, now),
+            )
+            conn.execute(
+                "UPDATE device_status SET online=1,updated_at=? WHERE device_id=?",
+                (now, device["id"]),
+            )
+            conn.execute(
+                "UPDATE devices SET last_seen_at=?,updated_at=? WHERE id=?",
+                (now, now, device["id"]),
+            )
+
+        database.transaction(connect_device)
+        await websocket.send_json(
+            {
+                "type": "server.hello",
+                "message_id": str(uuid.uuid4()),
+                "payload": {
+                    "protocol_version": 1,
+                    "heartbeat_interval_seconds": min(
+                        30, max(10, settings.device_offline_after_seconds // 3)
+                    ),
+                },
+            }
+        )
+        await hub.broadcast_dashboard(
+            {"type": "device.online", "device_id": device["id"], "time": now},
+            device["owner_user_id"],
+        )
+        try:
+            while True:
+                raw = await websocket.receive_json()
+                try:
+                    message = DeviceSocketMessage.model_validate(raw)
+                except ValueError:
+                    await websocket.send_json(
+                        {"type": "server.error", "payload": {"code": "INVALID_MESSAGE"}}
+                    )
+                    continue
+                await hub.touch(connection)
+                heartbeat_time = utc_now()
+                database.execute(
+                    "UPDATE device_sessions SET last_heartbeat_at=? WHERE id=?",
+                    (heartbeat_time, session_id),
+                )
+                database.execute(
+                    "UPDATE devices SET last_seen_at=?,updated_at=? WHERE id=?",
+                    (heartbeat_time, heartbeat_time, device["id"]),
+                )
+                if message.type in {"device.hello", "device.heartbeat"}:
+                    await websocket.send_json(
+                        {
+                            "type": "server.pong",
+                            "correlation_id": message.message_id,
+                            "payload": {"time": heartbeat_time},
+                        }
+                    )
+                elif message.type == "device.status":
+                    await handle_status_message(connection, device, message)
+                elif message.type in {"command.ack", "command.result"}:
+                    await handle_command_message(connection, device, message)
+                elif message.type == "screen.session.status":
+                    await handle_screen_status_message(connection, device, message)
+        except (WebSocketDisconnect, ValueError):
+            pass
+        finally:
+            await mark_disconnected(connection, "socket_closed")
+
+    return app
+
+
+app = create_app()

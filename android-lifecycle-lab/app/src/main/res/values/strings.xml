@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Device Owner 安全边界实验</string>
+    <string name="device_admin_label">Security Boundary Lab DPC</string>
+    <string name="device_admin_description">仅用于本人测试设备、可恢复且无远程控制能力的 Device Owner 边界实验</string>
+    <string name="projection_channel_name">可见的屏幕采集实验</string>
+    <string name="projection_channel_description">仅在系统授权后的屏幕采集期间显示</string>
+    <string name="projection_notification_title">SECURITY DEMO：屏幕采集进行中</string>
+    <string name="projection_notification_text">点击返回实验；可随时停止，不会隐藏通知</string>
+</resources>
