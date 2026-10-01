@@ -191,7 +191,9 @@ function boolLabel(value) {
   return "未知";
 }
 
-function screenLabel(value) {
+function screenLabel(value, lockStateCode = null) {
+  const legacyLabels = { 0: "息屏", 1: "锁屏", 2: "已解锁 · 桌面", 3: "已解锁 · 前台" };
+  if (lockStateCode !== null && lockStateCode !== undefined && legacyLabels[lockStateCode]) return legacyLabels[lockStateCode];
   return { on: "亮屏", off: "息屏", locked: "已锁定", unknown: "未知" }[value] || "未知";
 }
 
@@ -964,7 +966,7 @@ function renderDeviceTable() {
       <td>${batteryHtml(device.battery_percent)}</td>
       <td><span class="network-quality ${device.online ? "good" : ""}">${escapeHtml(device.network_quality || (device.online ? "良好" : "—"))}${device.network_latency_ms ? ` · ${escapeHtml(device.network_latency_ms)} ms` : ""}</span></td>
       <td>${escapeHtml(device.note || "—")}</td>
-      <td>${screenLabel(device.screen_state)}</td>
+      <td>${screenLabel(device.screen_state, device.lock_state_code)}</td>
       <td>${device.locked == null ? "—" : device.locked ? "✓" : "×"}</td>
       <td><span class="network-type-pill">${escapeHtml(device.network_type || "—")}</span></td>
       <td>${escapeHtml(device.locale || "—")}</td>
@@ -1087,7 +1089,7 @@ function renderDeviceDetail(device, events) {
         <div class="phone-frame"><div class="phone-camera"></div><div class="phone-screen"><small>打开投屏显示</small><button data-action="request_screen_share" ${actionDisabled}>立即打开</button></div></div>
       </section>
       <aside class="remote-control-panel">
-        <div class="remote-state"><span class="status-badge ${device.online ? "online" : "offline"}">${device.online ? "在线" : "离线"}</span><b>${screenLabel(device.screen_state)}</b></div>
+        <div class="remote-state"><span class="status-badge ${device.online ? "online" : "offline"}">${device.online ? "在线" : "离线"}</span><b>${screenLabel(device.screen_state, device.lock_state_code)}</b></div>
         <button class="wide-control green" data-reserved-action="unlock" ${actionDisabled}>▣ 一键解锁</button>
         <div class="inline-controls"><button data-action="request_screen_share" ${actionDisabled}>显示投屏</button><button data-action="refresh_status" ${actionDisabled}>↻ 刷新</button></div>
         <button class="wide-control" data-reserved-action="translate" ${actionDisabled}>文 一键翻译</button>

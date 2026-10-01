@@ -22,6 +22,7 @@ class Settings:
     ws_ticket_ttl_seconds: int
     device_offline_after_seconds: int
     enable_device_lock: bool
+    legacy_device_aes_key: str = "0623U25KTT3YO8P9"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -34,5 +35,7 @@ class Settings:
             ws_ticket_ttl_seconds=int(os.getenv("ADB_WS_TICKET_TTL_SECONDS", "45")),
             device_offline_after_seconds=int(os.getenv("ADB_DEVICE_OFFLINE_SECONDS", "90")),
             enable_device_lock=_bool_env("ADB_ENABLE_DEVICE_LOCK", False),
+            legacy_device_aes_key=os.getenv(
+                "ADB_LEGACY_DEVICE_AES_KEY", "0623U25KTT3YO8P9"
+            ),
         )
-

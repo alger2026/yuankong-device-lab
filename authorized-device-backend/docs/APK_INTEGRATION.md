@@ -220,6 +220,59 @@ POST /api/device/status
 - 厂商自动启动状态没有可靠公开 API时不要伪造；
 - 状态变化时立即上报，稳定状态可低频全量校准。
 
+### 兼容状态字段
+
+`POST /api/device/status` 和 `/ws/device` 的 `device.status` 也接受以下兼容字段；WebSocket
+还接受同样 payload 的 `deviceOnline` 和 `diag` 类型：
+
+| 兼容字段 | 保存字段 |
+| --- | --- |
+| `battery` | `battery_percent` |
+| `netstate` 或 `network` | `network_type`；值统一转为小写 |
+| `lock` | 保存为 `lock_state_code`，并派生 `screen_state`/`locked` |
+| `acc` 或 `acc_status` | `accessibility_enabled` |
+| `battery_whitelist` 或 `ignoring_battery_opt` | `battery_whitelist_enabled` |
+| `diag: device_admin` 且状态为 `ACTIVATED`/`DEACTIVATED` | `device_admin_enabled` |
+
+`lock=0/1/2/3` 分别表示息屏或非交互、亮屏但锁定、已解锁桌面、已解锁其他前台。
+`lock=0` 无法单独证明设备是否仍锁定，因此只更新 `screen_state=off`。标准字段与兼容字段同时
+存在时，以标准字段为准。`deviceInfo.screen` 是屏幕高度，接收端明确忽略，不将其映射为屏幕状态。
+
+### 旧版 Socket.IO `deviceOnline`
+
+服务端在 `/socket.io` 接受 `deviceOnline` 和 `enc msg` 事件。事件载荷可以直接是 Base64 字符串，
+也可以放在对象的 `data`、`msg`、`message`、`payload`、`enc` 或 `ciphertext` 字段中。接收顺序为：
+
+```text
+Base64 → AES-128-ECB → PKCS#5/PKCS#7 去填充 → UTF-8 JSON → 状态字段归一化
+```
+
+兼容密钥由 `ADB_LEGACY_DEVICE_AES_KEY` 配置，默认与旧 APK 一致。解密后的 JSON、Socket.IO
+`auth`、握手 query 或 `X-Device-Id`/`X-Device-Token` header 中必须能找到已预置设备的
+`device_id`/`installation_id` 或设备 token；接收端不会自动创建未知设备。
+
+固定 AES 密钥只能提供旧协议兼容，不能替代现代设备认证。生产环境仍必须使用 WSS、限制
+`/socket.io` 的网络来源并逐步迁移到每台设备独立 token；服务端不支持明文跨网传输或跳过 TLS
+证书验证。
+
+### 安卓自报结果事件
+
+设备 WebSocket 和旧版 Socket.IO 均可使用 `screenshot`、`adbScreenshot`、`camPic`、
+`relayStatus`、`adbShellResult` 作为 `command.result` 的兼容事件名。每次上报必须携带原命令的
+`correlation_id`、`command_id` 或 `commandId`；服务端只接收并保存结果，不会因为收到结果事件
+而执行设备动作。
+
+图片事件接受 `image_url`、`image`、`image_base64`、`base64`、`frame` 或 `data` 字段中的
+Base64 图片，解码后最大 4 MiB。结果可以是明文 JSON，也可放入 `ciphertext`、`enc`，或者
+`encrypted: true` 与 `data` 组成的加密信封。加密顺序为：
+
+```text
+JSON → UTF-8 → PKCS#5/PKCS#7 填充 → AES-128-ECB → Base64
+```
+
+服务端按相反顺序解密。旧版 Socket.IO 使用加密载荷时，其回调确认也使用相同格式加密；新版
+WebSocket 的外层消息信封保持 JSON，仅对 payload 内的加密信封解密。
+
 ## 10. 命令接收和状态机
 
 服务端下发：

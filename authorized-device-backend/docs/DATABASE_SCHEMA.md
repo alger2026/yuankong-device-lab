@@ -117,6 +117,7 @@
 | `network_type` | TEXT NULL | 如 `wifi`、`cellular`、`none` |
 | `screen_state` | TEXT | `on`、`off`、`locked` 或 `unknown` |
 | `locked` | INTEGER NULL | APK 能确认时上报的系统锁定状态 |
+| `lock_state_code` | INTEGER NULL | 兼容 APK 的 `lock` 原值：0 息屏、1 锁屏、2 已解锁桌面、3 已解锁其他前台 |
 | `accessibility_enabled` | INTEGER NULL | 本应用无障碍服务是否启用，只用于状态展示 |
 | `battery_whitelist_enabled` | INTEGER NULL | 是否忽略本应用电池优化 |
 | `device_admin_enabled` | INTEGER NULL | 合规设备管理能力状态 |

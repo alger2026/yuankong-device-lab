@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS device_status (
     network_latency_ms INTEGER,
     screen_state TEXT,
     locked INTEGER,
+    lock_state_code INTEGER,
     accessibility_enabled INTEGER,
     battery_whitelist_enabled INTEGER,
     device_admin_enabled INTEGER,
@@ -236,6 +237,7 @@ class Database:
             self._ensure_column(conn, "devices", "ip_address", "TEXT")
             self._ensure_column(conn, "device_status", "network_quality", "TEXT")
             self._ensure_column(conn, "device_status", "network_latency_ms", "INTEGER")
+            self._ensure_column(conn, "device_status", "lock_state_code", "INTEGER")
             self._ensure_column(
                 conn, "device_status", "uninstall_protection_enabled", "INTEGER"
             )

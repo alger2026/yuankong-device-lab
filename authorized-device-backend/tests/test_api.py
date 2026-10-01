@@ -1,19 +1,38 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
 import tempfile
 import uuid
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from app.config import Settings
+from app.legacy_protocol import decrypt_legacy_payload
 from app.main import create_app
 from app.security import token_hash, utc_now
 
 
 ADMIN_PASSWORD = "correct-horse-battery-staple"
+LEGACY_AES_KEY = "0623U25KTT3YO8P9"
+
+
+def encrypt_legacy_payload(payload: object) -> str:
+    plaintext = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+    encryptor = Cipher(
+        algorithms.AES(LEGACY_AES_KEY.encode("utf-8")), modes.ECB()
+    ).encryptor()
+    return base64.b64encode(encryptor.update(padded) + encryptor.finalize()).decode(
+        "ascii"
+    )
 
 
 def make_client(temp: tempfile.TemporaryDirectory) -> TestClient:
@@ -216,6 +235,307 @@ def test_device_websocket_status_command_and_dashboard() -> None:
 
                 offline = dashboard_ws.receive_json()
                 assert offline["type"] == "device.offline"
+        temp.cleanup()
+
+
+def test_legacy_device_status_aliases_and_diag() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            device_headers = {
+                "X-Device-Id": device["device_id"],
+                "X-Device-Token": device["device_token"],
+            }
+
+            legacy_status = client.post(
+                "/api/device/status",
+                headers=device_headers,
+                json={
+                    "battery": "73%",
+                    "charging": "1",
+                    "netstate": "5G",
+                    "lock": "2",
+                    "acc_status": "ACTIVATED",
+                    "ignoring_battery_opt": 1,
+                    "deviceInfo": {"screen": 2400},
+                },
+            )
+            assert legacy_status.status_code == 200, legacy_status.text
+
+            detail = client.get(
+                f"/api/devices/{device['device_id']}", headers=headers
+            ).json()["data"]
+            assert detail["battery_percent"] == 73
+            assert detail["charging"] == 1
+            assert detail["network_type"] == "5g"
+            assert detail["lock_state_code"] == 2
+            assert detail["screen_state"] == "on"
+            assert detail["locked"] == 0
+            assert detail["accessibility_enabled"] == 1
+            assert detail["battery_whitelist_enabled"] == 1
+
+            dashboard_ticket = client.post(
+                "/api/ws-ticket", headers=headers
+            ).json()["data"]["ticket"]
+            device_ticket = client.post(
+                "/api/device/ws-ticket", headers=device_headers
+            ).json()["data"]["ticket"]
+            with client.websocket_connect(
+                f"/ws/dashboard?ticket={dashboard_ticket}"
+            ) as dashboard_ws:
+                assert dashboard_ws.receive_json()["type"] == "server.hello"
+                with client.websocket_connect(
+                    f"/ws/device?ticket={device_ticket}"
+                ) as device_ws:
+                    assert device_ws.receive_json()["type"] == "server.hello"
+                    assert dashboard_ws.receive_json()["type"] == "device.online"
+
+                    device_ws.send_json(
+                        {
+                            "type": "deviceOnline",
+                            "payload": {
+                                "battery": 88,
+                                "network": "WIFI",
+                                "lock": 1,
+                                "acc": 0,
+                            },
+                        }
+                    )
+                    status_event = dashboard_ws.receive_json()
+                    assert status_event["type"] == "device.status"
+                    assert status_event["status"] == {
+                        "battery_percent": 88,
+                        "network_type": "wifi",
+                        "screen_state": "locked",
+                        "locked": True,
+                        "lock_state_code": 1,
+                        "accessibility_enabled": False,
+                    }
+
+                    device_ws.send_json(
+                        {
+                            "type": "diag",
+                            "payload": {
+                                "diag": "device_admin",
+                                "status": "ACTIVATED",
+                            },
+                        }
+                    )
+                    diag_event = dashboard_ws.receive_json()
+                    assert diag_event["type"] == "device.status"
+                    assert diag_event["status"] == {"device_admin_enabled": True}
+
+            detail = client.get(
+                f"/api/devices/{device['device_id']}", headers=headers
+            ).json()["data"]
+            assert detail["battery_percent"] == 88
+            assert detail["network_type"] == "wifi"
+            assert detail["lock_state_code"] == 1
+            assert detail["screen_state"] == "locked"
+            assert detail["locked"] == 1
+            assert detail["accessibility_enabled"] == 0
+            assert detail["device_admin_enabled"] == 1
+        temp.cleanup()
+
+
+def test_encrypted_socketio_device_online_status() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            sio = client.app.state.socketio_server
+            connect_handler = sio.handlers["/"]["connect"]
+            status_handler = sio.handlers["/"]["deviceOnline"]
+            encrypted_handler = sio.handlers["/"]["enc msg"]
+            sid = "legacy-test-sid"
+
+            connected = asyncio.run(
+                connect_handler(
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    {
+                        "device_id": device["device_id"],
+                        "device_token": device["device_token"],
+                    },
+                )
+            )
+            assert connected is True
+
+            encrypted = encrypt_legacy_payload(
+                {
+                    "event": "deviceOnline",
+                    "data": {
+                        "battery": 64,
+                        "charging": False,
+                        "netstate": "4G",
+                        "lock": 3,
+                        "acc": True,
+                        "battery_whitelist": False,
+                    },
+                }
+            )
+            accepted = asyncio.run(status_handler(sid, {"data": encrypted}))
+            assert accepted == {"accepted": True, "device_id": device["device_id"]}
+
+            diag_result = asyncio.run(
+                encrypted_handler(
+                    sid,
+                    encrypt_legacy_payload(
+                        {"type": "device_admin", "status": "ACTIVATED"}
+                    ),
+                )
+            )
+            assert diag_result == {
+                "accepted": True,
+                "device_id": device["device_id"],
+            }
+
+            detail = client.get(
+                f"/api/devices/{device['device_id']}", headers=headers
+            ).json()["data"]
+            assert detail["online"] == 1
+            assert detail["battery_percent"] == 64
+            assert detail["charging"] == 0
+            assert detail["network_type"] == "4g"
+            assert detail["lock_state_code"] == 3
+            assert detail["screen_state"] == "on"
+            assert detail["locked"] == 0
+            assert detail["accessibility_enabled"] == 1
+            assert detail["battery_whitelist_enabled"] == 0
+            assert detail["device_admin_enabled"] == 1
+        temp.cleanup()
+
+
+def test_named_android_self_reports_support_plain_and_encrypted_payloads() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            device_headers = {
+                "X-Device-Id": device["device_id"],
+                "X-Device-Token": device["device_token"],
+            }
+            ticket = client.post(
+                "/api/device/ws-ticket", headers=device_headers
+            ).json()["data"]["ticket"]
+            image_base64 = base64.b64encode(b"test-jpeg-bytes").decode("ascii")
+
+            with client.websocket_connect(f"/ws/device?ticket={ticket}") as device_ws:
+                assert device_ws.receive_json()["type"] == "server.hello"
+
+                plain_response = client.post(
+                    f"/api/devices/{device['device_id']}/workbench-actions/screenshot",
+                    headers=headers,
+                    json={"value": None, "payload": {}},
+                )
+                plain_command_id = plain_response.json()["data"]["command_id"]
+                assert device_ws.receive_json()["correlation_id"] == plain_command_id
+                device_ws.send_json(
+                    {
+                        "type": "screenshot",
+                        "message_id": str(uuid.uuid4()),
+                        "correlation_id": plain_command_id,
+                        "payload": {"base64": image_base64},
+                    }
+                )
+
+                encrypted_response = client.post(
+                    f"/api/devices/{device['device_id']}/workbench-actions/screenshot",
+                    headers=headers,
+                    json={"value": None, "payload": {}},
+                )
+                encrypted_command_id = encrypted_response.json()["data"]["command_id"]
+                assert device_ws.receive_json()["correlation_id"] == encrypted_command_id
+                device_ws.send_json(
+                    {
+                        "type": "adbScreenshot",
+                        "message_id": str(uuid.uuid4()),
+                        "payload": {
+                            "ciphertext": encrypt_legacy_payload(
+                                {
+                                    "command_id": encrypted_command_id,
+                                    "base64": image_base64,
+                                }
+                            )
+                        },
+                    }
+                )
+
+                heartbeat_id = str(uuid.uuid4())
+                device_ws.send_json(
+                    {
+                        "type": "device.heartbeat",
+                        "message_id": heartbeat_id,
+                        "payload": {},
+                    }
+                )
+                assert device_ws.receive_json()["correlation_id"] == heartbeat_id
+
+                for command_id, event_name in (
+                    (plain_command_id, "screenshot"),
+                    (encrypted_command_id, "adbScreenshot"),
+                ):
+                    command = client.get(
+                        f"/api/commands/{command_id}", headers=headers
+                    ).json()["data"]
+                    assert command["status"] == "success"
+                    assert command["result"] == {
+                        "event": event_name,
+                        "image_url": f"data:image/jpeg;base64,{image_base64}",
+                    }
+
+            sio = client.app.state.socketio_server
+            connect_handler = sio.handlers["/"]["connect"]
+            report_handler = sio.handlers["/"]["relayStatus"]
+            sid = "legacy-report-sid"
+            assert asyncio.run(
+                connect_handler(
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    {
+                        "device_id": device["device_id"],
+                        "device_token": device["device_token"],
+                    },
+                )
+            ) is True
+
+            relay_command_id = str(uuid.uuid4())
+            owner_id = client.get("/api/me", headers=headers).json()["data"]["id"]
+            now = utc_now()
+            client.app.state.db.execute(
+                "INSERT INTO commands(id,device_id,operator_id,action,payload_json,status,queued_at,sent_at) "
+                "VALUES(?,?,?,?,?,'sent',?,?)",
+                (
+                    relay_command_id,
+                    device["device_id"],
+                    owner_id,
+                    "relay-status-test",
+                    "{}",
+                    now,
+                    now,
+                ),
+            )
+            encrypted_report = encrypt_legacy_payload(
+                {
+                    "command_id": relay_command_id,
+                    "result": {"connected": True},
+                }
+            )
+            encrypted_ack = asyncio.run(report_handler(sid, encrypted_report))
+            assert decrypt_legacy_payload(encrypted_ack, LEGACY_AES_KEY) == {
+                "accepted": True,
+                "device_id": device["device_id"],
+                "correlation_id": relay_command_id,
+            }
+            relay_command = client.get(
+                f"/api/commands/{relay_command_id}", headers=headers
+            ).json()["data"]
+            assert relay_command["status"] == "success"
+            assert relay_command["result"] == {"connected": True}
         temp.cleanup()
 
 

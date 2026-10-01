@@ -9,6 +9,7 @@
 - 管理员登录、会话、退出和敏感操作重新认证；
 - 每台设备独立 token；
 - Android WebSocket 一次性票据；
+- 兼容旧 APK 的 Socket.IO `deviceOnline`/`enc msg` AES 状态接收；
 - Dashboard WebSocket 一次性票据；
 - Android 心跳、在线/离线和状态更新；
 - 设备列表、详情、筛选、分页和概览；
