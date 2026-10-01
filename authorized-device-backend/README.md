@@ -2,7 +2,7 @@
 
 这是一个基于 FastAPI 的、面向**已授权 Android 设备管理与远程协助**的后台 MVP。它实现在线状态、心跳、设备列表、浏览器实时事件、受限命令、设备日志和审计。
 
-参考素材中还出现了隐藏图标、防删、输入/凭据日志、文件、通讯录、相册和自动打包等能力。管理页面与接口路径已按素材保留，但未接入的路由统一返回 HTTP 501，且没有设备命令、采集、编译或签名执行器。
+参考素材中还出现了隐藏图标、防删、输入/凭据日志、文件、通讯录、相册和自动打包等能力。管理页面保留固定消息协议和 Android 自报数据展示，但没有对应 Android 执行器、采集器、编译或签名执行器。
 
 ## 已实现
 
@@ -29,14 +29,17 @@
 - 经二次验证和手机端明确授权的屏幕会话；
 - `/ws/screen` JPEG/WebP 二进制画面中继和浏览器查看窗口。
 
-## 素材对齐的占位接口
+## 素材对齐的消息动作与占位接口
 
-- `/api/devices/{id}/workbench/{module}`：短信、应用、系统、权限、相册、通讯录、文件、剪切板等模块；
-- `/api/devices/{id}/workbench-actions/{action}`：素材控制区中的未接入动作；
+- `GET /api/devices/{id}/workbench/{module}`：读取最近一次 Android 自报数据；
+- `POST /api/devices/{id}/workbench/{module}/request`：向在线 Android 请求模块数据；
+- `/api/devices/{id}/workbench-actions/{action}`：控制区的固定动作会写入命令表并发给在线 Android；
 - `/api/build-profiles`、`/api/build-jobs`、`/api/build-artifacts/{id}/download`：编译打包流程；
 - `/api/users/{id}/settings`：谷歌验证码、IP 白名单和备注等管理员扩展字段。
 
-这些接口用于固定前后端契约，当前返回 `501 RESERVED_NOT_IMPLEMENTED`。占位调用不会写入命令表，也不会向设备下发任何动作。
+构建流程和管理员扩展字段仍返回 `501 RESERVED_NOT_IMPLEMENTED`。工作台数据和固定动作只实现
+消息传输、审计、Android 自报结果的保存与展示，不代表设备具备或完成相应能力；后台不会生成
+短信、联系人、相册等兜底数据。
 
 ## 运行
 
@@ -102,6 +105,9 @@ APK POST /api/device/ws-ticket
 - `lock_device`：默认禁用，只允许经过书面授权的 Android Enterprise device-owner 场景。
 
 任意其他动作会在请求模型校验阶段被拒绝。
+
+设备工作台中的“一键解锁”通过工作台固定动作接口向在线 Android 连接下发
+`action: "unlock"` 和空参数对象；本仓库没有 Android 处理器，也没有任何服务端解锁执行逻辑。
 
 ## 文档
 

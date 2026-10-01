@@ -61,11 +61,12 @@ class DeviceUpdateRequest(StrictModel):
     name: str | None = Field(default=None, min_length=1, max_length=120)
     note: str | None = Field(default=None, max_length=1000)
     group_id: str | None = Field(default=None, max_length=80)
+    owner_user_id: str | None = Field(default=None, max_length=80)
     clear_group: bool = False
 
     @model_validator(mode="after")
     def require_change(self):
-        if self.name is None and self.note is None and self.group_id is None and not self.clear_group:
+        if self.name is None and self.note is None and self.group_id is None and self.owner_user_id is None and not self.clear_group:
             raise ValueError("at least one device field is required")
         if self.group_id is not None and self.clear_group:
             raise ValueError("group_id and clear_group cannot be used together")
@@ -139,7 +140,7 @@ class ScreenSessionRequest(StrictModel):
 
 
 class ReservedWorkbenchActionRequest(StrictModel):
-    """Shape only: reserved workbench routes intentionally have no executor."""
+    """Fixed workbench message with an action-specific, validated payload."""
 
     value: bool | str | int | None = None
     payload: dict[str, Any] = Field(default_factory=dict)

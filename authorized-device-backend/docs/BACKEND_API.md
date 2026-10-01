@@ -34,8 +34,9 @@
 | GET | `/api/devices/{id}` | 设备详情 |
 | PATCH | `/api/devices/{id}` | 修改设备名称、分组和备注 |
 | GET | `/api/devices/{id}/events` | 设备审计事件 |
-| GET | `/api/devices/{id}/workbench/{module}` | 素材工作台模块占位，返回 501 |
-| POST | `/api/devices/{id}/workbench-actions/{action}` | 素材工作台动作占位，返回 501 |
+| GET | `/api/devices/{id}/workbench/{module}` | 获取最近一次 Android 自报的模块数据 |
+| POST | `/api/devices/{id}/workbench/{module}/request` | 向在线 Android 下发固定模块查询消息 |
+| POST | `/api/devices/{id}/workbench-actions/{action}` | 下发固定工作台消息，返回命令号 |
 | POST | `/api/command` | 向在线设备提交白名单动作 |
 | GET | `/api/commands` | 命令历史、筛选和分页 |
 | GET | `/api/commands/{id}` | 查询命令状态 |
@@ -47,7 +48,7 @@
 | POST/GET | `/api/build-jobs`、`/api/build-jobs/{id}` | APK 构建任务占位，返回 501 |
 | GET | `/api/build-artifacts/{id}/download` | APK 产物下载占位，返回 501 |
 
-占位接口只验证登录、设备可见范围和固定名称，然后返回：
+仍未实现的占位接口只验证登录、设备可见范围和固定名称，然后返回：
 
 ```json
 {
@@ -59,7 +60,8 @@
 }
 ```
 
-这些路由没有设备命令分发器、数据采集器、Gradle 子进程或签名逻辑。
+这些占位路由没有 Gradle 子进程或签名逻辑。工作台数据和动作路由不属于占位路由；它们只分发
+固定动作名并保存 Android 自报结果，不接受脚本、Shell、自定义可执行参数或任意 Intent。
 
 ### 管理端接口参数
 
@@ -145,6 +147,9 @@ queued
 → acknowledged
 → success | failed
 ```
+
+`acknowledged`、`success` 和 `failed` 均来自 Android 消息。后台保存的是 Android 自报状态，
+不把它等同于设备真实完成状态。
 
 设备离线时，当前 MVP 将命令标记为失败并返回 HTTP 409，不做离线排队。
 

