@@ -1769,6 +1769,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             encrypted,
         )
 
+    def normalize_command_result(
+        message: DeviceSocketMessage,
+    ) -> tuple[DeviceSocketMessage, bool]:
+        decoded, encrypted = decode_android_self_report(message.payload)
+        if not encrypted:
+            return message, False
+        correlation_id = message.correlation_id or report_correlation_id(decoded)
+        if correlation_id is None:
+            raise LegacyProtocolError("encrypted command result is missing correlation_id")
+        result_payload = decoded
+        if isinstance(decoded, dict) and isinstance(decoded.get("payload"), dict):
+            result_payload = decoded["payload"]
+        if isinstance(result_payload, dict) and type(result_payload.get("success")) is bool:
+            normalized_payload = result_payload
+        elif isinstance(result_payload, dict) and "result" in result_payload:
+            normalized_payload = {
+                "success": True,
+                "result": result_payload["result"],
+            }
+        else:
+            normalized_payload = {"success": True, "result": result_payload}
+        return (
+            message.model_copy(
+                update={
+                    "correlation_id": correlation_id,
+                    "payload": normalized_payload,
+                }
+            ),
+            True,
+        )
+
     async def accept_legacy_socket_status(
         sid: str, event_name: str, raw_payload: Any
     ) -> dict[str, Any]:
@@ -1849,6 +1880,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @sio.on("enc msg")
     async def legacy_encrypted_message(sid: str, payload: Any):
+        try:
+            decoded = decrypt_legacy_payload(payload, settings.legacy_device_aes_key)
+        except LegacyProtocolError:
+            return await accept_legacy_socket_status(sid, "enc msg", payload)
+        declared_event = None
+        if isinstance(decoded, dict):
+            for key in ("type", "event", "name"):
+                if isinstance(decoded.get(key), str):
+                    declared_event = decoded[key]
+                    break
+        if declared_event in ANDROID_SELF_REPORT_TYPES:
+            return await accept_legacy_socket_report(
+                sid,
+                declared_event,
+                decoded,
+                encrypted_input=True,
+            )
+        if declared_event == "command.result" or report_correlation_id(decoded):
+            return await accept_legacy_socket_report(
+                sid,
+                "command.result",
+                decoded,
+                encrypted_input=True,
+            )
         return await accept_legacy_socket_status(sid, "enc msg", payload)
 
     @sio.on("diag")
@@ -1856,11 +1911,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return await accept_legacy_socket_status(sid, "diag", payload)
 
     async def accept_legacy_socket_report(
-        sid: str, event_name: str, raw_payload: Any
+        sid: str,
+        event_name: str,
+        raw_payload: Any,
+        encrypted_input: bool | None = None,
     ) -> dict[str, Any] | str:
         encrypted = False
         try:
-            decoded, encrypted = decode_android_self_report(raw_payload)
+            if encrypted_input is True:
+                decoded, encrypted = raw_payload, True
+            else:
+                decoded, encrypted = decode_android_self_report(raw_payload)
             context = legacy_contexts.get(sid, {})
             already_bound = legacy_bound_devices.get(sid)
             device = legacy_device_identity(decoded, context, already_bound)
@@ -1870,16 +1931,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             legacy_bound_devices[sid] = device["id"]
             message_payload = (
-                raw_payload
+                decoded
+                if encrypted_input is True
+                else raw_payload
                 if isinstance(raw_payload, dict)
                 else {"ciphertext": raw_payload}
             )
             report = DeviceSocketMessage(
-                type=event_name,
+                type=(
+                    event_name
+                    if event_name in ANDROID_SELF_REPORT_TYPES
+                    else "command.result"
+                ),
                 correlation_id=report_correlation_id(decoded),
                 payload=message_payload,
             )
-            normalized, _ = normalize_android_self_report(report)
+            if report.type == "command.result":
+                if encrypted_input is True:
+                    result_payload = decoded
+                    if isinstance(decoded, dict) and isinstance(decoded.get("payload"), dict):
+                        result_payload = decoded["payload"]
+                    if isinstance(result_payload, dict) and type(result_payload.get("success")) is bool:
+                        normalized_payload = result_payload
+                    elif isinstance(result_payload, dict) and "result" in result_payload:
+                        normalized_payload = {
+                            "success": True,
+                            "result": result_payload["result"],
+                        }
+                    else:
+                        normalized_payload = {"success": True, "result": result_payload}
+                    normalized = report.model_copy(update={"payload": normalized_payload})
+                else:
+                    normalized, _ = normalize_command_result(report)
+            else:
+                normalized, _ = normalize_android_self_report(report)
             accepted = await handle_command_message(None, device, normalized)
             if not accepted:
                 raise LegacyProtocolError("Android self-report references an unknown command")
@@ -1918,6 +2003,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @sio.on("adbShellResult")
     async def legacy_adb_shell_result(sid: str, payload: Any):
         return await accept_legacy_socket_report(sid, "adbShellResult", payload)
+
+    @sio.on("command.result")
+    async def legacy_command_result(sid: str, payload: Any):
+        return await accept_legacy_socket_report(sid, "command.result", payload)
 
     @sio.event
     async def disconnect(sid: str, *args: Any):
@@ -2939,6 +3028,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 elif message.type in {"device.status", "deviceOnline", "diag"}:
                     await handle_status_message(connection, device, message)
                 elif message.type in {"command.ack", "command.result"}:
+                    if message.type == "command.result":
+                        try:
+                            message, _ = normalize_command_result(message)
+                        except LegacyProtocolError as exc:
+                            await websocket.send_json(
+                                {
+                                    "type": "server.error",
+                                    "correlation_id": message.message_id,
+                                    "payload": {
+                                        "code": "INVALID_COMMAND_RESULT",
+                                        "message": str(exc),
+                                    },
+                                }
+                            )
+                            continue
                     await handle_command_message(connection, device, message)
                 elif message.type in ANDROID_SELF_REPORT_TYPES:
                     try:

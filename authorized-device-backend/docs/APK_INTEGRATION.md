@@ -325,6 +325,12 @@ ACK：
 }
 ```
 
+`command.result` 的 `payload` 也可以使用第 9 节所述的 AES/Base64 加密信封。解密后的 JSON
+必须携带同一个 `correlation_id`/`command_id`，并包含标准的 `success` 与 `result`。此方式适用于
+`messages`、`apps`、`system`、`permissions`、`gallery`、`contacts`、`files` 和 `clipboard`
+工作台模块；结果仍按对应命令保存为 Android 自报数据。旧版 Socket.IO 也可通过加密的
+`enc msg` 或 `command.result` 事件提交同一结构。
+
 失败结果：
 
 ```json

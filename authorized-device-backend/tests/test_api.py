@@ -539,6 +539,82 @@ def test_named_android_self_reports_support_plain_and_encrypted_payloads() -> No
         temp.cleanup()
 
 
+def test_encrypted_command_results_are_saved_for_workbench_modules() -> None:
+    modules = (
+        "messages",
+        "apps",
+        "system",
+        "permissions",
+        "gallery",
+        "contacts",
+        "files",
+        "clipboard",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            device_headers = {
+                "X-Device-Id": device["device_id"],
+                "X-Device-Token": device["device_token"],
+            }
+            ticket = client.post(
+                "/api/device/ws-ticket", headers=device_headers
+            ).json()["data"]["ticket"]
+            expected_results: dict[str, dict[str, object]] = {}
+
+            with client.websocket_connect(f"/ws/device?ticket={ticket}") as device_ws:
+                assert device_ws.receive_json()["type"] == "server.hello"
+                for module in modules:
+                    response = client.post(
+                        f"/api/devices/{device['device_id']}/workbench/{module}/request",
+                        headers=headers,
+                    )
+                    assert response.status_code == 202, response.text
+                    command_id = response.json()["data"]["command_id"]
+                    assert device_ws.receive_json()["correlation_id"] == command_id
+                    result = {"items": [{"source": "android", "module": module}]}
+                    expected_results[module] = result
+                    device_ws.send_json(
+                        {
+                            "type": "command.result",
+                            "message_id": str(uuid.uuid4()),
+                            "payload": {
+                                "enc": encrypt_legacy_payload(
+                                    {
+                                        "command_id": command_id,
+                                        "payload": {
+                                            "success": True,
+                                            "result": result,
+                                        },
+                                    }
+                                )
+                            },
+                        }
+                    )
+
+                heartbeat_id = str(uuid.uuid4())
+                device_ws.send_json(
+                    {
+                        "type": "device.heartbeat",
+                        "message_id": heartbeat_id,
+                        "payload": {},
+                    }
+                )
+                assert device_ws.receive_json()["correlation_id"] == heartbeat_id
+
+            for module in modules:
+                reported = client.get(
+                    f"/api/devices/{device['device_id']}/workbench/{module}",
+                    headers=headers,
+                )
+                assert reported.status_code == 200, reported.text
+                assert reported.json()["data"]["source"] == "android_self_reported"
+                assert reported.json()["data"]["data"] == expected_results[module]
+        temp.cleanup()
+
+
 def test_log_idempotency_action_allowlist_and_disabled_lock() -> None:
     with tempfile.TemporaryDirectory() as directory:
         temp = tempfile.TemporaryDirectory(dir=directory)
