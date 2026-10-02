@@ -29,9 +29,13 @@
 | `password_hash` | TEXT | PBKDF2 密码摘要，不保存明文 |
 | `role` | TEXT | `admin`、`operator` 或 `viewer` |
 | `status` | TEXT | `active` 或 `disabled` |
+| `ip_whitelist` | TEXT | 每行一个规范化 IP/CIDR；空值表示不限制 |
+| `note` | TEXT | 管理员备注 |
+| `totp_secret` | TEXT NULL | TOTP Base32 密钥；接口不会回传明文 |
+| `deleted_at` | TEXT NULL | 软删除时间；删除后不能登录且会话被撤销 |
 | `created_at` | TEXT | 创建时间 |
 
-首次启动创建一个管理员，之后可由管理员在账号管理页面新增账号、修改角色或状态、重置密码。敏感账号操作要求最近二次验证。
+首次启动创建一个管理员，之后可由管理员在账号管理页面新增、编辑或软删除账号，修改角色或状态，设置登录 IP 白名单和 TOTP，并重置密码。敏感账号操作要求最近二次验证。
 
 ## `sessions`：管理端登录会话
 

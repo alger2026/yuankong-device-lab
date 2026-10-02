@@ -36,9 +36,10 @@
 - `POST /api/devices/{id}/workbench/{module}/request`：向在线 Android 请求模块数据；
 - `/api/devices/{id}/workbench-actions/{action}`：控制区的固定动作会写入命令表并发给在线 Android；
 - `/api/build-profiles`、`/api/build-jobs`、`/api/build-artifacts/{id}/download`：编译打包流程；
-- `/api/users/{id}/settings`：谷歌验证码、IP 白名单和备注等管理员扩展字段。
+- `/api/users/{id}/settings`：谷歌验证码、IP 白名单和备注等管理员扩展字段，登录时会实际校验；
+- `/api/system/status`：返回 API、数据库和实时连接状态。
 
-构建流程和管理员扩展字段仍返回 `501 RESERVED_NOT_IMPLEMENTED`。工作台数据和固定动作只实现
+只有构建流程仍返回 `501 RESERVED_NOT_IMPLEMENTED`。工作台数据和固定动作只实现
 消息传输、审计、Android 自报结果的保存与展示，不代表设备具备或完成相应能力；后台不会生成
 短信、联系人、相册等兜底数据。
 

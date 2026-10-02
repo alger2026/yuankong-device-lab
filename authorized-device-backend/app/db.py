@@ -20,7 +20,11 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL CHECK(role IN ('admin','operator','viewer')),
     status TEXT NOT NULL CHECK(status IN ('active','disabled')),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    ip_whitelist TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    totp_secret TEXT,
+    deleted_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -59,6 +63,12 @@ CREATE TABLE IF NOT EXISTS devices (
     locale TEXT,
     timezone TEXT,
     ip_address TEXT,
+    socket_id TEXT,
+    last_online_at TEXT,
+    last_heartbeat_at TEXT,
+    last_heartbeat_epoch INTEGER,
+    fcm_token TEXT,
+    fcm_token_updated_at TEXT,
     device_token_hash TEXT NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
@@ -84,6 +94,19 @@ CREATE TABLE IF NOT EXISTS device_status (
     camera_permission_enabled INTEGER,
     uninstall_protection_enabled INTEGER,
     launcher_icon_visible INTEGER,
+    screen_interactive INTEGER,
+    idle_mode INTEGER,
+    memory_available_mb INTEGER,
+    memory_total_mb INTEGER,
+    memory_low INTEGER,
+    last_acc_event TEXT,
+    last_acc_event_at TEXT,
+    battery_stage TEXT,
+    battery_message TEXT,
+    battery_status_at TEXT,
+    device_admin_status TEXT,
+    device_admin_message TEXT,
+    device_admin_updated_at TEXT,
     reported_at TEXT,
     updated_at TEXT NOT NULL
 );
@@ -178,6 +201,103 @@ CREATE TABLE IF NOT EXISTS device_logs (
     UNIQUE(device_id, event_uid)
 );
 
+CREATE TABLE IF NOT EXISTS device_data_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    action TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    received_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_data_reports_device_action
+ON device_data_reports(device_id, action, received_at);
+
+CREATE TABLE IF NOT EXISTS device_heartbeats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    event TEXT NOT NULL,
+    build_id TEXT NOT NULL,
+    client_timestamp INTEGER NOT NULL,
+    battery INTEGER NOT NULL,
+    acc_status TEXT NOT NULL,
+    received_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_heartbeats_device_received
+ON device_heartbeats(device_id, received_at);
+
+CREATE TABLE IF NOT EXISTS device_diagnostics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    diagnostic_type TEXT NOT NULL,
+    event TEXT,
+    message TEXT,
+    reason TEXT,
+    client_timestamp INTEGER NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_diagnostics_device_created
+ON device_diagnostics(device_id, diagnostic_type, created_at);
+
+CREATE TABLE IF NOT EXISTS device_expected_state (
+    device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+    state_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS device_runtime_state (
+    device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+    state_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS device_stream_sessions (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    stream_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    parameters_json TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    stop_sent_at TEXT,
+    stopped_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_device_stream_sessions_device
+ON device_stream_sessions(device_id, stream_type, started_at);
+
+CREATE TABLE IF NOT EXISTS device_binary_frames (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    frame_type INTEGER NOT NULL,
+    sequence_no INTEGER NOT NULL,
+    payload BLOB NOT NULL,
+    received_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_binary_frames_device
+ON device_binary_frames(device_id, frame_type, received_at);
+
+CREATE TABLE IF NOT EXISTS device_cache (
+    device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    cache_key TEXT NOT NULL,
+    cache_json TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY(device_id, cache_key)
+);
+
+CREATE TABLE IF NOT EXISTS device_line_configs (
+    device_id TEXT NOT NULL,
+    apk_id TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    PRIMARY KEY(device_id, apk_id)
+);
+
+CREATE TABLE IF NOT EXISTS install_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    app_name TEXT NOT NULL,
+    action TEXT NOT NULL,
+    device_uid TEXT NOT NULL,
+    requested_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     actor_type TEXT NOT NULL,
@@ -225,6 +345,10 @@ class Database:
     def initialize(self, admin_username: str, admin_password: str) -> None:
         with self._lock, self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_column(conn, "users", "ip_whitelist", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "note", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "users", "totp_secret", "TEXT")
+            self._ensure_column(conn, "users", "deleted_at", "TEXT")
             self._ensure_column(
                 conn,
                 "devices",
@@ -235,6 +359,12 @@ class Database:
             self._ensure_column(conn, "devices", "locale", "TEXT")
             self._ensure_column(conn, "devices", "timezone", "TEXT")
             self._ensure_column(conn, "devices", "ip_address", "TEXT")
+            self._ensure_column(conn, "devices", "socket_id", "TEXT")
+            self._ensure_column(conn, "devices", "last_online_at", "TEXT")
+            self._ensure_column(conn, "devices", "last_heartbeat_at", "TEXT")
+            self._ensure_column(conn, "devices", "last_heartbeat_epoch", "INTEGER")
+            self._ensure_column(conn, "devices", "fcm_token", "TEXT")
+            self._ensure_column(conn, "devices", "fcm_token_updated_at", "TEXT")
             self._ensure_column(conn, "device_status", "network_quality", "TEXT")
             self._ensure_column(conn, "device_status", "network_latency_ms", "INTEGER")
             self._ensure_column(conn, "device_status", "lock_state_code", "INTEGER")
@@ -244,6 +374,22 @@ class Database:
             self._ensure_column(
                 conn, "device_status", "launcher_icon_visible", "INTEGER"
             )
+            for column, definition in (
+                ("screen_interactive", "INTEGER"),
+                ("idle_mode", "INTEGER"),
+                ("memory_available_mb", "INTEGER"),
+                ("memory_total_mb", "INTEGER"),
+                ("memory_low", "INTEGER"),
+                ("last_acc_event", "TEXT"),
+                ("last_acc_event_at", "TEXT"),
+                ("battery_stage", "TEXT"),
+                ("battery_message", "TEXT"),
+                ("battery_status_at", "TEXT"),
+                ("device_admin_status", "TEXT"),
+                ("device_admin_message", "TEXT"),
+                ("device_admin_updated_at", "TEXT"),
+            ):
+                self._ensure_column(conn, "device_status", column, definition)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_devices_group ON devices(group_id)"
             )

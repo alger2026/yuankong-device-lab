@@ -92,6 +92,14 @@ class RealtimeHub:
         async with self._lock:
             return device_id in self._devices
 
+    async def stats(self) -> dict[str, int]:
+        async with self._lock:
+            return {
+                "device_connections": len(self._devices),
+                "dashboard_connections": len(self._dashboards),
+                "screen_sessions": len(self._screens),
+            }
+
     async def send_command(self, device_id: str, message: dict[str, Any]) -> bool:
         async with self._lock:
             connection = self._devices.get(device_id)

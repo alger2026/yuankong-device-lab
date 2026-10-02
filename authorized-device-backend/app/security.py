@@ -4,6 +4,8 @@ import base64
 import hashlib
 import hmac
 import secrets
+import struct
+import time
 from datetime import datetime, timezone
 
 
@@ -54,3 +56,34 @@ def verify_password(password: str, encoded: str) -> bool:
     except (ValueError, TypeError):
         return False
 
+
+def normalize_totp_secret(value: str) -> str:
+    secret = "".join(value.upper().split()).rstrip("=")
+    if not 16 <= len(secret) <= 128:
+        raise ValueError("TOTP secret must contain 16-128 Base32 characters")
+    try:
+        base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("TOTP secret must be valid Base32") from exc
+    return secret
+
+
+def verify_totp(code: str, secret: str, *, at_epoch: int | None = None) -> bool:
+    normalized_code = "".join(code.split())
+    if len(normalized_code) != 6 or not normalized_code.isdigit():
+        return False
+    try:
+        normalized_secret = normalize_totp_secret(secret)
+        key = base64.b32decode(
+            normalized_secret + "=" * (-len(normalized_secret) % 8), casefold=True
+        )
+    except ValueError:
+        return False
+    current_step = int(time.time() if at_epoch is None else at_epoch) // 30
+    for offset in (-1, 0, 1):
+        digest = hmac.new(key, struct.pack(">Q", current_step + offset), hashlib.sha1).digest()
+        start = digest[-1] & 0x0F
+        value = (struct.unpack(">I", digest[start : start + 4])[0] & 0x7FFFFFFF) % 1_000_000
+        if hmac.compare_digest(f"{value:06d}", normalized_code):
+            return True
+    return False

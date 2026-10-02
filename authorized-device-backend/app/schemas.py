@@ -13,6 +13,7 @@ class StrictModel(BaseModel):
 class LoginRequest(StrictModel):
     username: str = Field(min_length=1, max_length=80)
     password: str = Field(min_length=1, max_length=256)
+    otp_code: str | None = Field(default=None, min_length=6, max_length=8)
 
 
 class ReauthRequest(StrictModel):
@@ -28,17 +29,35 @@ class UserCreateRequest(StrictModel):
     username: str = Field(min_length=2, max_length=80, pattern=r"^[A-Za-z0-9_.-]+$")
     password: str = Field(min_length=12, max_length=256)
     role: Literal["admin", "operator", "viewer"]
+    status: Literal["active", "disabled"] = "active"
+    ip_whitelist: str = Field(default="", max_length=2000)
+    note: str = Field(default="", max_length=1000)
+    totp_secret: str | None = Field(default=None, min_length=16, max_length=128)
 
 
 class UserUpdateRequest(StrictModel):
     role: Literal["admin", "operator", "viewer"] | None = None
     status: Literal["active", "disabled"] | None = None
     password: str | None = Field(default=None, min_length=12, max_length=256)
+    ip_whitelist: str | None = Field(default=None, max_length=2000)
+    note: str | None = Field(default=None, max_length=1000)
+    totp_secret: str | None = Field(default=None, min_length=16, max_length=128)
+    clear_totp: bool = False
 
     @model_validator(mode="after")
     def require_change(self):
-        if self.role is None and self.status is None and self.password is None:
+        if (
+            self.role is None
+            and self.status is None
+            and self.password is None
+            and self.ip_whitelist is None
+            and self.note is None
+            and self.totp_secret is None
+            and not self.clear_totp
+        ):
             raise ValueError("at least one user field is required")
+        if self.totp_secret is not None and self.clear_totp:
+            raise ValueError("totp_secret and clear_totp cannot be used together")
         return self
 
 
@@ -194,6 +213,19 @@ class DeviceLogRequest(StrictModel):
     message: str = Field(default="", max_length=2000)
     details: dict[str, Any] = Field(default_factory=dict)
     device_time: str | None = Field(default=None, max_length=40)
+
+
+class HeartbeatRequest(StrictModel):
+    event: Literal["heartbeat"]
+    build_id: str = Field(alias="buildId", min_length=1, max_length=160)
+    ts: int = Field(ge=0)
+    brand: str = Field(min_length=1, max_length=255)
+    model: str = Field(min_length=1, max_length=255)
+    sdk: int = Field(ge=0, le=1000)
+    device_id: str = Field(alias="deviceId", min_length=1, max_length=160)
+    package_name: str = Field(alias="packageName", min_length=1, max_length=255)
+    acc_status: Literal["on", "off"]
+    battery: int = Field(ge=0, le=100)
 
 
 class BatteryGuideRequest(StrictModel):

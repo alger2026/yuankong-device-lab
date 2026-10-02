@@ -46,6 +46,8 @@
             <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="256" placeholder="请输入密码">
             <button class="password-toggle" type="button" id="toggle-password" aria-label="显示密码">显示</button>
           </div>
+          <label class="field-label" for="otp-code">Google 验证码（已启用账号必填）</label>
+          <input id="otp-code" name="otp_code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6 位动态验证码">
           <p id="login-error" class="form-error" role="alert"></p>
           <button id="login-button" class="primary-button login-button" type="submit">
             <span>登录</span><span aria-hidden="true">→</span>
@@ -116,17 +118,17 @@
               <div class="metric-icon">⌁</div>
               <p>在线设备</p><strong id="metric-online">—</strong><span id="metric-online-copy">等待连接数据</span>
             </article>
-            <article class="metric-card coral hidden">
+            <article class="metric-card coral">
               <div class="metric-icon">○</div>
               <p>离线设备</p><strong id="metric-offline">—</strong><span>当前无有效长连接</span>
             </article>
-            <article class="metric-card violet hidden">
+            <article class="metric-card violet">
               <div class="metric-icon">◇</div>
               <p>连接率</p><strong id="metric-rate">—</strong><span>根据实时连接计算</span>
             </article>
           </div>
 
-          <div class="content-grid hidden">
+          <div class="content-grid">
             <section class="panel recent-panel">
               <div class="panel-head"><div><p class="eyebrow">DEVICE SNAPSHOT</p><h3>最近设备</h3></div><button class="text-button" data-go="devices">查看全部 →</button></div>
               <div id="recent-device-list" class="recent-device-list"></div>
@@ -205,7 +207,7 @@
           <div class="section-heading"><div><p class="eyebrow">SUPPORT TEMPLATES</p><h1>消息模板</h1><p>维护会明确显示在授权设备应用内的支持说明，不伪装成系统消息。</p></div></div>
           <div class="template-grid">
             <section class="panel template-form-panel">
-              <div class="panel-head"><div><p class="eyebrow">NEW TEMPLATE</p><h3>新增模板</h3></div></div>
+              <div class="panel-head"><div><p class="eyebrow">TEMPLATE</p><h3 id="template-form-title">新增模板</h3></div><button id="cancel-template-edit" class="text-button hidden" type="button">取消编辑</button></div>
               <form id="template-form" class="stack-form padded-form">
                 <label class="field-label" for="template-name">模板名称</label><input id="template-name" required maxlength="100" placeholder="例如：请检查网络设置">
                 <label class="field-label" for="template-content">显示内容</label><textarea id="template-content" required maxlength="200" placeholder="设备持有人将在应用内看到这段说明"></textarea>
@@ -224,7 +226,7 @@
           <div class="section-heading"><div><p class="eyebrow">DEVICE CONFIGURATION</p><h1>设备配置</h1><p>维护设备分组以及不同品牌、型号的电池设置说明。</p></div></div>
           <div class="management-grid">
             <section class="panel management-panel">
-              <div class="panel-head"><div><p class="eyebrow">DEVICE GROUPS</p><h3>设备分组</h3></div></div>
+              <div class="panel-head"><div><p class="eyebrow">DEVICE GROUPS</p><h3 id="group-form-title">设备分组</h3></div><button id="cancel-group-edit" class="text-button hidden" type="button">取消编辑</button></div>
               <form id="group-form" class="compact-form">
                 <input id="group-name" required maxlength="80" placeholder="分组名称">
                 <input id="group-description" maxlength="500" placeholder="分组说明（可选）">
@@ -233,7 +235,7 @@
               <div id="group-list" class="management-list"><div class="loading-block">正在加载分组…</div></div>
             </section>
             <section class="panel management-panel">
-              <div class="panel-head"><div><p class="eyebrow">BATTERY GUIDES</p><h3>电池设置说明</h3></div></div>
+              <div class="panel-head"><div><p class="eyebrow">BATTERY GUIDES</p><h3 id="battery-guide-form-title">电池设置说明</h3></div><button id="cancel-guide-edit" class="text-button hidden" type="button">取消编辑</button></div>
               <form id="battery-guide-form" class="stack-form">
                 <div class="form-row"><input id="guide-brand" required maxlength="80" placeholder="品牌，例如 Xiaomi"><input id="guide-model" required maxlength="120" value="*" placeholder="型号匹配，例如 14* 或 *"></div>
                 <input id="guide-title" required maxlength="160" placeholder="说明标题">
@@ -255,6 +257,7 @@
               <button id="reload-users" class="icon-button" aria-label="刷新">↻</button>
             </div>
             <div class="table-wrap"><table class="device-table user-table material-user-table"><thead><tr><th>账户</th><th>类别</th><th>状态</th><th>指定IP登录</th><th>登录状态</th><th>登录时间</th><th>创建时间</th><th>备注</th><th>操作</th></tr></thead><tbody id="user-table-body"></tbody></table></div>
+            <div class="pagination"><span id="user-pagination-summary">共 0 个账号</span><div><button id="user-previous-page" class="page-button">‹</button><span id="user-page-indicator">1 / 1</span><button id="user-next-page" class="page-button">›</button></div></div>
           </section>
         </section>
 
@@ -285,12 +288,21 @@
         <section id="view-system" class="view">
           <div class="section-heading"><div><p class="eyebrow">CONNECTION & SYSTEM</p><h1>连接与系统</h1><p>查看浏览器、服务端和 APK 之间的通信状态。</p></div><a class="secondary-button link-button" href="/docs" target="_blank" rel="noreferrer">打开 API 文档 ↗</a></div>
           <div class="system-grid">
-            <section class="panel system-card"><span class="system-icon">◎</span><div><h3>HTTP API</h3><p>登录、设备列表、状态补传、日志和命令创建。</p><code>/api/*</code></div><b class="status-pill success">正常</b></section>
+            <section class="panel system-card"><span class="system-icon">◎</span><div><h3>HTTP API</h3><p>登录、设备列表、状态补传、日志和命令创建。</p><code>/api/*</code></div><b id="system-api-status" class="status-pill warning">检测中</b></section>
             <section class="panel system-card"><span class="system-icon">⌁</span><div><h3>管理端实时通道</h3><p>向当前页面推送设备在线状态和命令结果。</p><code>/ws/dashboard</code></div><b id="system-dashboard-ws" class="status-pill warning">连接中</b></section>
-            <section class="panel system-card"><span class="system-icon">▯</span><div><h3>Android 实时通道</h3><p>APK 心跳、状态上报、命令 ACK 与执行结果。</p><code>/ws/device</code></div><b class="status-pill neutral">等待设备</b></section>
-            <section class="panel system-card"><span class="system-icon">▤</span><div><h3>媒体通道</h3><p>屏幕共享需要用户授权；支持中继 Android 回传的 JPEG/WebP 帧。</p><code>/ws/screen</code></div><b class="status-pill success">已实现</b></section>
+            <section class="panel system-card"><span class="system-icon">▯</span><div><h3>Android 实时通道</h3><p>APK 心跳、状态上报、命令 ACK 与执行结果。</p><code>/ws/device</code></div><b id="system-device-status" class="status-pill neutral">检测中</b></section>
+            <section class="panel system-card"><span class="system-icon">▤</span><div><h3>媒体通道</h3><p>屏幕共享需要用户授权；支持中继 Android 回传的 JPEG/WebP 帧。</p><code>/ws/screen</code></div><b id="system-screen-status" class="status-pill neutral">检测中</b></section>
           </div>
           <section class="panel boundary-panel"><h3>当前能力边界</h3><div><span>✓</span><p><strong>已实现</strong>设备状态、心跳、命令、日志和审计。</p></div><div><span>○</span><p><strong>需要 APK</strong>手机端必须按照对接文档实现并连接后，设备列表才会出现数据。</p></div><div><span>!</span><p><strong>明确授权</strong>屏幕协助必须经过手机持有人确认并显示持续通知。</p></div></section>
+          <section class="panel password-panel">
+            <div class="panel-head"><div><p class="eyebrow">ACCOUNT SECURITY</p><h3>修改当前账号密码</h3></div></div>
+            <form id="password-form" class="compact-form padded-form">
+              <input id="current-password" type="password" required autocomplete="current-password" placeholder="当前密码">
+              <input id="changed-password" type="password" required minlength="12" autocomplete="new-password" placeholder="新密码（至少 12 位）">
+              <input id="changed-password-confirm" type="password" required minlength="12" autocomplete="new-password" placeholder="再次输入新密码">
+              <button class="primary-button" type="submit">修改密码</button>
+            </form>
+          </section>
         </section>
       </main>
     </div>
@@ -304,16 +316,17 @@
 
   <dialog id="user-dialog" class="modal material-modal">
     <form id="user-form">
-      <div class="modal-head"><div><h3>新增</h3></div><button id="close-user-dialog" class="icon-button" type="button">×</button></div>
+      <div class="modal-head"><div><h3 id="user-dialog-title">新增管理员</h3></div><button id="close-user-dialog" class="icon-button" type="button">×</button></div>
       <label class="field-label" for="new-user-role">类型</label><select id="new-user-role"><option value="operator">普通管理员</option><option value="admin">超级管理员</option><option value="viewer">只读账号</option></select>
       <label class="field-label" for="new-username">账户</label><input id="new-username" required minlength="2" maxlength="80" pattern="[A-Za-z0-9_.-]+" placeholder="请输入">
       <label class="field-label" for="new-user-password">设置密码</label><input id="new-user-password" type="password" required minlength="12" maxlength="256" autocomplete="new-password" placeholder="请输入">
       <label class="field-label">状态</label><label class="material-switch-row">开关<input id="new-user-active" type="checkbox" checked><span></span></label>
-      <label class="field-label" for="new-user-google-code">谷歌验证码</label><input id="new-user-google-code" placeholder="请输入（接口占位）">
-      <label class="field-label" for="new-user-ip-list">IP白名单</label><textarea id="new-user-ip-list" placeholder="请输入（接口占位）"></textarea>
-      <label class="field-label" for="new-user-note">备注</label><textarea id="new-user-note" placeholder="请输入（接口占位）"></textarea>
+      <label class="field-label" for="new-user-google-code">Google Authenticator Base32 密钥（可选）</label><input id="new-user-google-code" autocomplete="off" placeholder="编辑时留空表示不修改">
+      <label id="clear-user-totp-row" class="material-switch-row hidden">清除已有 Google 验证<input id="clear-user-totp" type="checkbox"><span></span></label>
+      <label class="field-label" for="new-user-ip-list">IP 白名单</label><textarea id="new-user-ip-list" placeholder="每行一个 IP 或 CIDR；留空表示不限制"></textarea>
+      <label class="field-label" for="new-user-note">备注</label><textarea id="new-user-note" placeholder="账号备注"></textarea>
       <label class="field-label" for="admin-confirm-password">当前管理员密码</label><input id="admin-confirm-password" type="password" required autocomplete="current-password" placeholder="用于敏感操作验证">
-      <p class="reserved-note">谷歌验证码、IP白名单和备注字段按素材保留；当前账号接口尚未保存这些扩展字段。</p>
+      <p class="reserved-note">启用 Google 验证后，登录时必须同时填写 6 位动态验证码。IP 白名单按服务端识别到的客户端地址校验。</p>
       <div class="modal-actions"><button id="cancel-user-dialog" class="secondary-button" type="button">关闭</button><button class="primary-button" type="submit">确认</button></div>
     </form>
   </dialog>

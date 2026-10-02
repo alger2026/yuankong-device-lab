@@ -19,11 +19,19 @@ const state = {
   commandTotal: 0,
   commandPageSize: 20,
   users: [],
+  userOptions: [],
+  userPage: 1,
+  userPageSize: 20,
+  userTotal: 0,
   batteryGuides: [],
   templates: [],
   selectedDeviceId: null,
   selectedDevice: null,
   pendingAfterReauth: null,
+  editingUserId: null,
+  editingGroupId: null,
+  editingGuideId: null,
+  editingTemplateId: null,
   screenSocket: null,
   screenSessionId: null,
   screenObjectUrl: null,
@@ -153,6 +161,9 @@ function errorMessage(body, status) {
       "invalid package_name": "应用包名格式不正确",
       "clipboard text is required": "请输入剪切板内容",
       "invalid clipboard text": "剪切板内容格式不正确或过长",
+      "cannot delete your own account": "不能删除当前登录账号",
+      "at least one active admin is required": "系统至少需要保留一个启用的超级管理员",
+      "cannot change your own role or status": "不能修改当前账号自己的角色或状态",
     };
     return map[detail] || detail;
   }
@@ -210,10 +221,15 @@ function setLoading(button, loading, text = "处理中…") {
   if (!button) return;
   if (loading) {
     button.dataset.originalText = button.textContent;
+    button.dataset.loadingText = text;
     button.textContent = text;
     button.disabled = true;
   } else {
-    button.textContent = button.dataset.originalText || button.textContent;
+    if (button.textContent === button.dataset.loadingText) {
+      button.textContent = button.dataset.originalText || button.textContent;
+    }
+    delete button.dataset.originalText;
+    delete button.dataset.loadingText;
     button.disabled = false;
   }
 }
@@ -232,6 +248,10 @@ function showApp() {
   $("#user-role").textContent = roleLabel(state.user.role);
   $("#user-avatar").textContent = state.user.username.slice(0, 1).toUpperCase();
   $$(".admin-only").forEach((item) => item.classList.toggle("hidden", state.user.role !== "admin"));
+  const canWrite = ["admin", "operator"].includes(state.user.role);
+  ["#template-form", "#group-form", "#battery-guide-form"].forEach((selector) => {
+    $(selector)?.classList.toggle("hidden", !canWrite);
+  });
 }
 
 async function handleLogin(event) {
@@ -246,12 +266,14 @@ async function handleLogin(event) {
       body: JSON.stringify({
         username: $("#username").value.trim(),
         password: $("#password").value,
+        otp_code: $("#otp-code").value.trim() || null,
       }),
     });
     state.token = result.data.token;
     state.user = result.data.user;
     sessionStorage.setItem("device_admin_token", state.token);
     $("#password").value = "";
+    $("#otp-code").value = "";
     showApp();
     await startAuthenticatedApp();
   } catch (error) {
@@ -284,6 +306,7 @@ async function startAuthenticatedApp() {
     commands: loadCommands,
     configuration: loadBatteryGuides,
     capabilities: loadCapabilities,
+    system: loadSystemStatus,
   }[initialView];
   await Promise.allSettled([
     loadOverview(), loadDevices(), loadGroups(), loadTemplates(),
@@ -340,6 +363,29 @@ function showView(view, updateHash = true, loadData = true) {
     if (view === "configuration") loadConfiguration();
     if (view === "users") loadUsers();
     if (view === "capabilities") loadCapabilities();
+    if (view === "system") loadSystemStatus();
+  }
+}
+
+async function loadSystemStatus() {
+  try {
+    const result = await api("/api/system/status");
+    const data = result.data;
+    const apiStatus = $("#system-api-status");
+    apiStatus.textContent = data.api === "ok" && data.database === "ok" ? "运行正常" : "异常";
+    apiStatus.className = `status-pill ${data.api === "ok" && data.database === "ok" ? "success" : "unavailable"}`;
+    const deviceStatus = $("#system-device-status");
+    deviceStatus.textContent = `${data.devices.online}/${data.devices.total} 在线 · ${data.realtime.device_connections} 条实时连接`;
+    deviceStatus.className = `status-pill ${data.devices.online ? "success" : "neutral"}`;
+    const screenStatus = $("#system-screen-status");
+    screenStatus.textContent = data.realtime.screen_sessions ? `${data.realtime.screen_sessions} 个活动会话` : "暂无活动会话";
+    screenStatus.className = `status-pill ${data.realtime.screen_sessions ? "success" : "neutral"}`;
+  } catch (error) {
+    ["#system-api-status", "#system-device-status", "#system-screen-status"].forEach((selector) => {
+      const target = $(selector);
+      target.textContent = "检测失败";
+      target.className = "status-pill unavailable";
+    });
   }
 }
 
@@ -449,8 +495,9 @@ async function loadGroups() {
 function renderGroups() {
   const list = $("#group-list");
   if (!list) return;
+  const canWrite = ["admin", "operator"].includes(state.user?.role);
   list.innerHTML = state.groups.length ? state.groups.map((group) => `
-    <article class="management-item"><div><h4>${escapeHtml(group.name)}</h4><p>${escapeHtml(group.description || "暂无说明")}</p></div><span class="management-count">${group.device_count}</span></article>`).join("") : `<div class="loading-block">还没有设备分组</div>`;
+    <article class="management-item"><div><h4>${escapeHtml(group.name)}</h4><p>${escapeHtml(group.description || "暂无说明")}</p></div><span class="management-count">${group.device_count}</span>${canWrite ? `<div class="row-actions"><button type="button" data-group-edit="${escapeHtml(group.id)}">编辑</button><button type="button" class="danger" data-group-delete="${escapeHtml(group.id)}">删除</button></div>` : ""}</article>`).join("") : `<div class="loading-block">还没有设备分组</div>`;
 }
 
 async function loadConfiguration() {
@@ -460,18 +507,19 @@ async function loadConfiguration() {
 async function createGroup(event) {
   event.preventDefault();
   const button = $("#group-form button");
+  const editing = Boolean(state.editingGroupId);
   setLoading(button, true, "添加中…");
   try {
-    await api("/api/device-groups", {
-      method: "POST",
+    await api(editing ? `/api/device-groups/${encodeURIComponent(state.editingGroupId)}` : "/api/device-groups", {
+      method: editing ? "PATCH" : "POST",
       body: JSON.stringify({
         name: $("#group-name").value.trim(),
         description: $("#group-description").value.trim(),
       }),
     });
-    $("#group-form").reset();
+    resetGroupForm();
     await loadGroups();
-    showToast("设备分组已添加");
+    showToast(editing ? "设备分组已更新" : "设备分组已添加");
   } catch (error) {
     showToast(error.message, "error");
   } finally {
@@ -479,13 +527,43 @@ async function createGroup(event) {
   }
 }
 
+function resetGroupForm() {
+  state.editingGroupId = null;
+  $("#group-form").reset();
+  $("#group-form-title").textContent = "设备分组";
+  $("#group-form button[type='submit']").textContent = "添加分组";
+  $("#cancel-group-edit").classList.add("hidden");
+}
+
+function editGroup(groupId) {
+  const group = state.groups.find((item) => item.id === groupId);
+  if (!group) return;
+  state.editingGroupId = groupId;
+  $("#group-name").value = group.name;
+  $("#group-description").value = group.description || "";
+  $("#group-form-title").textContent = "编辑设备分组";
+  $("#group-form button[type='submit']").textContent = "保存修改";
+  $("#cancel-group-edit").classList.remove("hidden");
+}
+
+async function deleteGroup(groupId) {
+  if (!window.confirm("删除分组后，组内设备会变为未分组。确认继续？")) return;
+  try {
+    await api(`/api/device-groups/${encodeURIComponent(groupId)}`, { method: "DELETE" });
+    if (state.editingGroupId === groupId) resetGroupForm();
+    await Promise.all([loadGroups(), loadDevices()]);
+    showToast("设备分组已删除");
+  } catch (error) { showToast(error.message, "error"); }
+}
+
 async function loadBatteryGuides() {
   try {
     const result = await api("/api/battery-guides");
     state.batteryGuides = result.data;
     const list = $("#battery-guide-list");
+    const canWrite = ["admin", "operator"].includes(state.user?.role);
     list.innerHTML = state.batteryGuides.length ? state.batteryGuides.map((guide) => `
-      <article class="management-item"><div><h4>${escapeHtml(guide.title)}</h4><p>${guide.steps.map((step, index) => `${index + 1}. ${escapeHtml(step)}`).join("<br>")}</p><code>${escapeHtml(guide.brand)} / ${escapeHtml(guide.model_pattern)}</code></div><span class="capability-status ${guide.enabled ? "implemented" : "unavailable"}">${guide.enabled ? "启用" : "停用"}</span></article>`).join("") : `<div class="loading-block">暂无电池设置说明</div>`;
+      <article class="management-item"><div><h4>${escapeHtml(guide.title)}</h4><p>${guide.steps.map((step, index) => `${index + 1}. ${escapeHtml(step)}`).join("<br>")}</p><code>${escapeHtml(guide.brand)} / ${escapeHtml(guide.model_pattern)}</code></div><span class="capability-status ${guide.enabled ? "implemented" : "unavailable"}">${guide.enabled ? "启用" : "停用"}</span>${canWrite ? `<div class="row-actions"><button type="button" data-guide-toggle="${escapeHtml(guide.id)}">${guide.enabled ? "停用" : "启用"}</button><button type="button" data-guide-edit="${escapeHtml(guide.id)}">编辑</button><button type="button" class="danger" data-guide-delete="${escapeHtml(guide.id)}">删除</button></div>` : ""}</article>`).join("") : `<div class="loading-block">暂无电池设置说明</div>`;
   } catch (error) {
     $("#battery-guide-list").innerHTML = `<div class="loading-block">${escapeHtml(error.message)}</div>`;
   }
@@ -497,25 +575,73 @@ async function createBatteryGuide(event) {
   const steps = $("#guide-steps").value.split("\n").map((value) => value.trim()).filter(Boolean);
   setLoading(button, true, "保存中…");
   try {
-    await api("/api/battery-guides", {
-      method: "POST",
+    const editing = Boolean(state.editingGuideId);
+    await api(editing ? `/api/battery-guides/${encodeURIComponent(state.editingGuideId)}` : "/api/battery-guides", {
+      method: editing ? "PUT" : "POST",
       body: JSON.stringify({
         brand: $("#guide-brand").value.trim(),
         model_pattern: $("#guide-model").value.trim(),
         title: $("#guide-title").value.trim(),
         steps,
-        enabled: true,
+        enabled: state.editingGuideId ? Boolean(state.batteryGuides.find((guide) => guide.id === state.editingGuideId)?.enabled) : true,
       }),
     });
-    $("#battery-guide-form").reset();
-    $("#guide-model").value = "*";
+    resetGuideForm();
     await loadBatteryGuides();
-    showToast("电池设置说明已添加");
+    showToast(editing ? "电池设置说明已更新" : "电池设置说明已添加");
   } catch (error) {
     showToast(error.message, "error");
   } finally {
     setLoading(button, false);
   }
+}
+
+function resetGuideForm() {
+  state.editingGuideId = null;
+  $("#battery-guide-form").reset();
+  $("#guide-model").value = "*";
+  $("#battery-guide-form-title").textContent = "电池设置说明";
+  $("#battery-guide-form button[type='submit']").textContent = "添加设置说明";
+  $("#cancel-guide-edit").classList.add("hidden");
+}
+
+function editGuide(guideId) {
+  const guide = state.batteryGuides.find((item) => item.id === guideId);
+  if (!guide) return;
+  state.editingGuideId = guideId;
+  $("#guide-brand").value = guide.brand;
+  $("#guide-model").value = guide.model_pattern;
+  $("#guide-title").value = guide.title;
+  $("#guide-steps").value = guide.steps.join("\n");
+  $("#battery-guide-form-title").textContent = "编辑电池设置说明";
+  $("#battery-guide-form button[type='submit']").textContent = "保存修改";
+  $("#cancel-guide-edit").classList.remove("hidden");
+}
+
+async function deleteGuide(guideId) {
+  if (!window.confirm("确认删除这条电池设置说明？")) return;
+  try {
+    await api(`/api/battery-guides/${encodeURIComponent(guideId)}`, { method: "DELETE" });
+    if (state.editingGuideId === guideId) resetGuideForm();
+    await loadBatteryGuides();
+    showToast("电池设置说明已删除");
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+async function toggleGuide(guideId) {
+  const guide = state.batteryGuides.find((item) => item.id === guideId);
+  if (!guide) return;
+  try {
+    await api(`/api/battery-guides/${encodeURIComponent(guideId)}`, {
+      method: "PUT",
+      body: JSON.stringify({
+        brand: guide.brand, model_pattern: guide.model_pattern,
+        title: guide.title, steps: guide.steps, enabled: !guide.enabled,
+      }),
+    });
+    await loadBatteryGuides();
+    showToast(guide.enabled ? "电池设置说明已停用" : "电池设置说明已启用");
+  } catch (error) { showToast(error.message, "error"); }
 }
 
 async function loadTemplates() {
@@ -524,8 +650,9 @@ async function loadTemplates() {
     const result = await api("/api/message-templates");
     state.templates = result.data;
     const list = $("#template-list");
+    const canWrite = ["admin", "operator"].includes(state.user?.role);
     list.innerHTML = state.templates.length ? state.templates.map((template) => `
-      <article class="template-item"><h4>${escapeHtml(template.name)}</h4><p>${escapeHtml(template.content)}</p><small>${escapeHtml(template.owner_name)} · ${formatTime(template.updated_at)}</small><span class="capability-status ${template.enabled ? "implemented" : "unavailable"}">${template.enabled ? "启用" : "停用"}</span></article>`).join("") : `<div class="loading-block">还没有消息模板</div>`;
+      <article class="template-item"><h4>${escapeHtml(template.name)}</h4><p>${escapeHtml(template.content)}</p><small>${escapeHtml(template.owner_name)} · ${formatTime(template.updated_at)}</small><span class="capability-status ${template.enabled ? "implemented" : "unavailable"}">${template.enabled ? "启用" : "停用"}</span>${canWrite ? `<div class="row-actions"><button type="button" data-template-toggle="${escapeHtml(template.id)}" data-next-enabled="${template.enabled ? "false" : "true"}">${template.enabled ? "停用" : "启用"}</button><button type="button" data-template-edit="${escapeHtml(template.id)}">编辑</button><button type="button" class="danger" data-template-delete="${escapeHtml(template.id)}">删除</button></div>` : ""}</article>`).join("") : `<div class="loading-block">还没有消息模板</div>`;
     const select = $("#support-template");
     select.innerHTML = `<option value="">选择消息模板（可选）</option>` + state.templates.filter((item) => item.enabled).map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join("");
   } catch (error) {
@@ -536,20 +663,20 @@ async function loadTemplates() {
 async function createTemplate(event) {
   event.preventDefault();
   const button = $("#template-form button[type='submit']");
+  const editing = Boolean(state.editingTemplateId);
   setLoading(button, true, "保存中…");
   try {
-    await api("/api/message-templates", {
-      method: "POST",
+    await api(editing ? `/api/message-templates/${encodeURIComponent(state.editingTemplateId)}` : "/api/message-templates", {
+      method: editing ? "PATCH" : "POST",
       body: JSON.stringify({
         name: $("#template-name").value.trim(),
         content: $("#template-content").value.trim(),
-        enabled: true,
+        enabled: editing ? Boolean(state.templates.find((item) => item.id === state.editingTemplateId)?.enabled) : true,
       }),
     });
-    $("#template-form").reset();
-    $("#template-count").textContent = "0";
+    resetTemplateForm();
     await loadTemplates();
-    showToast("消息模板已保存");
+    showToast(editing ? "消息模板已更新" : "消息模板已保存");
   } catch (error) {
     showToast(error.message, "error");
   } finally {
@@ -557,29 +684,80 @@ async function createTemplate(event) {
   }
 }
 
+function resetTemplateForm() {
+  state.editingTemplateId = null;
+  $("#template-form").reset();
+  $("#template-count").textContent = "0";
+  $("#template-form-title").textContent = "新增模板";
+  $("#cancel-template-edit").classList.add("hidden");
+}
+
+function editTemplate(templateId) {
+  const template = state.templates.find((item) => item.id === templateId);
+  if (!template) return;
+  state.editingTemplateId = templateId;
+  $("#template-name").value = template.name;
+  $("#template-content").value = template.content;
+  $("#template-count").textContent = String(template.content.length);
+  $("#template-form-title").textContent = "编辑模板";
+  $("#cancel-template-edit").classList.remove("hidden");
+}
+
+async function updateTemplate(templateId, body, successMessage) {
+  try {
+    await api(`/api/message-templates/${encodeURIComponent(templateId)}`, {
+      method: "PATCH", body: JSON.stringify(body),
+    });
+    await loadTemplates();
+    showToast(successMessage);
+  } catch (error) { showToast(error.message, "error"); }
+}
+
+async function deleteTemplate(templateId) {
+  if (!window.confirm("确认删除这个消息模板？")) return;
+  try {
+    await api(`/api/message-templates/${encodeURIComponent(templateId)}`, { method: "DELETE" });
+    if (state.editingTemplateId === templateId) resetTemplateForm();
+    await loadTemplates();
+    showToast("消息模板已删除");
+  } catch (error) { showToast(error.message, "error"); }
+}
+
 async function loadUsers() {
   if (state.user?.role !== "admin") return;
   const body = $("#user-table-body");
   body.innerHTML = `<tr><td colspan="9"><div class="loading-block">正在加载账号…</div></td></tr>`;
-  const params = new URLSearchParams({ page_size: "100" });
+  const params = new URLSearchParams({
+    page: String(state.userPage), page_size: String(state.userPageSize),
+  });
   const q = $("#user-search")?.value.trim();
   const status = $("#user-status-filter")?.value;
   if (q) params.set("q", q);
   if (status) params.set("status", status);
   try {
-    const result = await api(`/api/users?${params}`);
+    const [result, optionsResult] = await Promise.all([
+      api(`/api/users?${params}`), api("/api/user-options"),
+    ]);
     state.users = result.data;
+    state.userOptions = optionsResult.data;
+    state.userTotal = result.meta.total;
+    state.userPage = result.meta.page;
     const ownerSelect = $("#filter-owner");
     if (ownerSelect) {
       const currentOwner = ownerSelect.value;
-      ownerSelect.innerHTML = `<option value="">管理员</option>` + state.users.map((account) => `<option value="${escapeHtml(account.id)}">${escapeHtml(account.username)}</option>`).join("");
+      ownerSelect.innerHTML = `<option value="">管理员</option>` + state.userOptions.map((account) => `<option value="${escapeHtml(account.id)}">${escapeHtml(account.username)}</option>`).join("");
       ownerSelect.value = currentOwner;
     }
     body.innerHTML = state.users.map((account) => {
       const isSelf = account.id === state.user.id;
       const lastLogin = account.last_login_epoch ? new Date(account.last_login_epoch * 1000).toLocaleString("zh-CN") : "—";
-      return `<tr><td><strong>${escapeHtml(account.username)}</strong>${isSelf ? '<span class="device-subline">当前账号</span>' : ""}</td><td>${roleLabel(account.role)}</td><td><button class="material-toggle ${account.status === "active" ? "on" : ""}" ${isSelf ? "disabled" : ""} data-user-toggle="${escapeHtml(account.id)}" data-next-status="${account.status === "active" ? "disabled" : "active"}" aria-label="切换状态"><i></i></button></td><td>${escapeHtml(account.ip_whitelist || "—")}</td><td><span class="command-state ${account.last_login_epoch ? "success" : "queued"}">${account.last_login_epoch ? "在线" : "—"}</span></td><td>${lastLogin}</td><td>${formatTime(account.created_at)}</td><td>${escapeHtml(account.note || "—")}</td><td><div class="user-actions"><button class="mini-button" data-user-edit="${escapeHtml(account.id)}">编辑</button>${isSelf ? "" : `<button class="mini-button danger" data-user-delete="${escapeHtml(account.id)}">删除</button>`}</div></td></tr>`;
+      return `<tr><td><strong>${escapeHtml(account.username)}</strong>${isSelf ? '<span class="device-subline">当前账号</span>' : ""}${account.totp_enabled ? '<span class="device-subline">Google 验证已启用</span>' : ""}</td><td>${roleLabel(account.role)}</td><td><button class="material-toggle ${account.status === "active" ? "on" : ""}" ${isSelf ? "disabled" : ""} data-user-toggle="${escapeHtml(account.id)}" data-next-status="${account.status === "active" ? "disabled" : "active"}" aria-label="切换状态"><i></i></button></td><td><div class="multiline-cell">${escapeHtml(account.ip_whitelist || "—")}</div></td><td><span class="command-state ${account.online ? "success" : "queued"}">${account.online ? "在线" : "离线"}</span></td><td>${lastLogin}</td><td>${formatTime(account.created_at)}</td><td>${escapeHtml(account.note || "—")}</td><td><div class="user-actions"><button class="mini-button" data-user-edit="${escapeHtml(account.id)}">编辑</button>${isSelf ? "" : `<button class="mini-button danger" data-user-delete="${escapeHtml(account.id)}">删除</button>`}</div></td></tr>`;
     }).join("");
+    const pages = Math.max(1, Math.ceil(state.userTotal / state.userPageSize));
+    $("#user-pagination-summary").textContent = `共 ${state.userTotal} 个账号`;
+    $("#user-page-indicator").textContent = `${state.userPage} / ${pages}`;
+    $("#user-previous-page").disabled = state.userPage <= 1;
+    $("#user-next-page").disabled = state.userPage >= pages;
   } catch (error) {
     body.innerHTML = `<tr><td colspan="9"><div class="loading-block">${escapeHtml(error.message)}</div></td></tr>`;
   }
@@ -594,23 +772,73 @@ async function createUser(event) {
       method: "POST",
       body: JSON.stringify({ password: $("#admin-confirm-password").value }),
     });
-    await api("/api/users", {
-      method: "POST",
-      body: JSON.stringify({
-        username: $("#new-username").value.trim(),
-        password: $("#new-user-password").value,
-        role: $("#new-user-role").value,
-      }),
+    const editing = Boolean(state.editingUserId);
+    const editingSelf = state.editingUserId === state.user.id;
+    const body = {
+      ip_whitelist: $("#new-user-ip-list").value.trim(),
+      note: $("#new-user-note").value.trim(),
+    };
+    if (!editingSelf) {
+      body.role = $("#new-user-role").value;
+      body.status = $("#new-user-active").checked ? "active" : "disabled";
+    }
+    const password = $("#new-user-password").value;
+    const secret = $("#new-user-google-code").value.trim();
+    if (password) body.password = password;
+    if (secret) body.totp_secret = secret;
+    if (editing && $("#clear-user-totp").checked) body.clear_totp = true;
+    if (!editing) body.username = $("#new-username").value.trim();
+    await api(editing ? `/api/users/${encodeURIComponent(state.editingUserId)}` : "/api/users", {
+      method: editing ? "PATCH" : "POST", body: JSON.stringify(body),
     });
-    $("#user-form").reset();
+    resetUserForm();
     $("#user-dialog").close();
     await loadUsers();
-    showToast("后台账号已创建");
+    showToast(editing ? "后台账号已更新" : "后台账号已创建");
   } catch (error) {
     showToast(error.message, "error");
   } finally {
     setLoading(button, false);
   }
+}
+
+function resetUserForm() {
+  state.editingUserId = null;
+  $("#user-form").reset();
+  $("#new-user-active").checked = true;
+  $("#new-username").disabled = false;
+  $("#new-user-role").disabled = false;
+  $("#new-user-active").disabled = false;
+  $("#new-user-password").required = true;
+  $("#new-user-password").placeholder = "请输入";
+  $("#clear-user-totp-row").classList.add("hidden");
+  $("#user-dialog-title").textContent = "新增管理员";
+}
+
+function openCreateUserDialog() {
+  resetUserForm();
+  $("#user-dialog").showModal();
+}
+
+function editUser(userId) {
+  const account = state.users.find((item) => item.id === userId);
+  if (!account) return;
+  resetUserForm();
+  state.editingUserId = userId;
+  const isSelf = userId === state.user.id;
+  $("#user-dialog-title").textContent = "编辑管理员";
+  $("#new-username").value = account.username;
+  $("#new-username").disabled = true;
+  $("#new-user-role").value = account.role;
+  $("#new-user-role").disabled = isSelf;
+  $("#new-user-active").checked = account.status === "active";
+  $("#new-user-active").disabled = isSelf;
+  $("#new-user-password").required = false;
+  $("#new-user-password").placeholder = "留空表示不修改密码";
+  $("#new-user-ip-list").value = account.ip_whitelist || "";
+  $("#new-user-note").value = account.note || "";
+  $("#clear-user-totp-row").classList.toggle("hidden", !account.totp_enabled);
+  $("#user-dialog").showModal();
 }
 
 async function changeOwnPassword(event) {
@@ -650,11 +878,12 @@ async function toggleUser(userId, status) {
 }
 
 async function callReservedUserDelete(userId) {
-  try {
+  if (!window.confirm("删除后账号将无法登录，已有审计记录会保留。确认继续？")) return;
+  requestReauth(async () => {
     await api(`/api/users/${encodeURIComponent(userId)}`, { method: "DELETE" });
-  } catch (error) {
-    showToast(error.message, "error");
-  }
+    await loadUsers();
+    showToast("后台账号已删除");
+  });
 }
 
 async function submitReservedBuildProfile(event) {
@@ -781,7 +1010,7 @@ function renderWorkbenchModule(module, data, completedAt) {
     if (!items.length) return head + empty;
     return head + `<div class="gallery-grid">${items.map((item) => {
       const url = safeMediaUrl(item.thumbnail || item.url || item.uri);
-      return `<article>${url ? `<img src="${escapeHtml(url)}" alt="${escapeHtml(itemValue(item, "name"))}">` : `<div class="gallery-placeholder">▧</div>`}<strong>${escapeHtml(itemValue(item, "name", "display_name"))}</strong><small>${escapeHtml(formatBytes(item.size))}</small></article>`;
+      return `<article>${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(url)}" alt="${escapeHtml(itemValue(item, "name"))}"></a>` : `<div class="gallery-placeholder">▧</div>`}<strong>${escapeHtml(itemValue(item, "name", "display_name"))}</strong><small>${escapeHtml(formatBytes(item.size))}</small></article>`;
     }).join("")}</div>`;
   }
   if (module === "contacts") {
@@ -790,7 +1019,16 @@ function renderWorkbenchModule(module, data, completedAt) {
   }
   if (module === "files") {
     if (!items.length) return head + empty;
-    return head + `<div class="file-path">根目录：${escapeHtml(data?.path || "/")}</div><div class="table-wrap"><table class="module-table"><thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead><tbody>${items.map((item) => `<tr><td>${item.type === "directory" ? "▰" : "▤"} ${escapeHtml(itemValue(item, "name"))}</td><td>${escapeHtml(item.type === "directory" ? "—" : formatBytes(item.size))}</td><td>${formatTime(itemValue(item, "modified_at", "updated_at"))}</td><td>${item.uri ? `<button type="button" data-copy-text="${escapeHtml(item.uri)}">复制路径</button>` : "—"}</td></tr>`).join("")}</tbody></table></div>`;
+    return head + `<div class="file-path">当前目录：${escapeHtml(data?.path || "/")}</div><div class="table-wrap"><table class="module-table"><thead><tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead><tbody>${items.map((item) => {
+      const itemPath = item.path || item.uri || "";
+      const url = safeMediaUrl(item.url || item.download_url || item.uri);
+      const action = item.type === "directory" && itemPath
+        ? `<button type="button" data-file-path="${escapeHtml(itemPath)}">打开</button>`
+        : url
+          ? `<a class="module-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">下载/打开</a>`
+          : itemPath ? `<button type="button" data-copy-text="${escapeHtml(itemPath)}">复制路径</button>` : "—";
+      return `<tr><td>${item.type === "directory" ? "▰" : "▤"} ${escapeHtml(itemValue(item, "name"))}</td><td>${escapeHtml(item.type === "directory" ? "—" : formatBytes(item.size))}</td><td>${formatTime(itemValue(item, "modified_at", "updated_at"))}</td><td>${action}</td></tr>`;
+    }).join("")}</tbody></table></div>`;
   }
   if (module === "clipboard") {
     const text = typeof data === "string" ? data : String(data?.text ?? "");
@@ -825,11 +1063,12 @@ async function loadWorkbenchModule(module) {
   }
 }
 
-async function requestWorkbenchModule(module) {
+async function requestWorkbenchModule(module, payload = {}) {
   if (!state.selectedDeviceId) return;
   try {
     const result = await api(`/api/devices/${encodeURIComponent(state.selectedDeviceId)}/workbench/${encodeURIComponent(module)}/request`, {
       method: "POST",
+      body: JSON.stringify(payload),
     });
     showToast(`发送命令成功: ${workbenchModuleLabels[module] || module}。具体结果会在处理完毕时通知`);
     await loadWorkbenchModule(module);
@@ -1056,6 +1295,9 @@ function renderDeviceDetail(device, events) {
           <button data-workbench-tab="contacts">▤ 通讯录</button>
           <button data-workbench-tab="files">▰ 文件</button>
           <button data-workbench-tab="clipboard">✂ 剪切板</button>
+          <button data-workbench-tab="input-events">⌁ 输入事件</button>
+          <button data-workbench-tab="credential-events">◇ 验证事件</button>
+          <button data-workbench-tab="camera">◉ 摄像头数据</button>
         </div>
         <div class="workbench-panel active" data-workbench-panel="logs">
           <div class="material-status-tabs" data-log-filters><button class="active" data-log-filter="">全部</button><button data-log-filter="三方APP">三方APP</button><button data-log-filter="锁屏">锁屏</button><button data-log-filter="应用锁">应用锁</button></div>
@@ -1072,13 +1314,16 @@ function renderDeviceDetail(device, events) {
           ${detailItem("手机型号", device.model)}${detailItem("安卓版本", `Android ${device.android_version} (SDK ${device.sdk_int})`)}${detailItem("是否插卡", "—")}
           ${detailItem("号码1", "—")}${detailItem("有效内存", "—")}${detailItem("总计内存", "—")}${detailItem("CPU", "—")}
         </div><div class="camera-copy"><strong>摄像头</strong><small>点击拍照图片在 截图 查看</small></div><div class="camera-actions"><button data-reserved-action="front-camera" ${actionDisabled}>前-拍照</button><button data-reserved-action="rear-camera" ${actionDisabled}>后-拍照</button><button data-reserved-action="camera" ${actionDisabled}>打开实时预览</button></div><div class="module-result action-media-result" data-action-result="camera"></div><button class="secondary-button small" data-reserved-module="system" ${actionDisabled}>刷新系统信息</button><div class="module-result" data-workbench-result="system"></div></div>
-        <div class="workbench-panel" data-workbench-panel="permissions"><div class="permission-header"><h3>权限管理 <small>手动引导授权</small></h3><label><input type="checkbox" ${actionDisabled}> 自动化</label><button data-action="refresh_status" ${actionDisabled}>↻ 刷新</button></div><div class="permission-list">
+        <div class="workbench-panel" data-workbench-panel="permissions"><div class="permission-header"><h3>权限管理 <small>手动引导授权</small></h3><button data-reserved-action="autoRequestPerm" ${actionDisabled}>自动请求权限</button><button data-action="refresh_status" ${actionDisabled}>↻ 刷新</button></div><div class="permission-list">
           ${permissionRow("无障碍权限", device.accessibility_enabled)}${permissionRow("电池白名单", device.battery_whitelist_enabled)}${permissionRow("短信权限", null)}${permissionRow("相册权限", null)}${permissionRow("自动启动", null)}${permissionRow("管理员", device.device_admin_enabled)}
         </div><button class="secondary-button small" data-reserved-module="permissions" ${actionDisabled}>刷新</button><div class="module-result" data-workbench-result="permissions"><div class="loading-block">暂无数据~</div></div></div>
         <div class="workbench-panel" data-workbench-panel="gallery">${workbenchPlaceholder("相册", device.id, "gallery")}</div>
         <div class="workbench-panel" data-workbench-panel="contacts">${workbenchPlaceholder("通讯录", device.id, "contacts")}</div>
         <div class="workbench-panel" data-workbench-panel="files">${workbenchPlaceholder("根目录", device.id, "files")}</div>
         <div class="workbench-panel" data-workbench-panel="clipboard">${workbenchPlaceholder("剪切板内容", device.id, "clipboard")}</div>
+        <div class="workbench-panel" data-workbench-panel="input-events">${workbenchPlaceholder("输入事件", device.id, "input-events")}</div>
+        <div class="workbench-panel" data-workbench-panel="credential-events">${workbenchPlaceholder("验证事件", device.id, "credential-events")}</div>
+        <div class="workbench-panel" data-workbench-panel="camera">${workbenchPlaceholder("摄像头数据", device.id, "camera")}</div>
       </section>
       <section class="overlay-mode-panel">
         <strong>遮盖层/仿页</strong>
@@ -1093,6 +1338,8 @@ function renderDeviceDetail(device, events) {
         <button class="wide-control green" data-reserved-action="unlock" ${actionDisabled}>▣ 一键解锁</button>
         <div class="inline-controls"><button data-action="request_screen_share" ${actionDisabled}>显示投屏</button><button data-action="refresh_status" ${actionDisabled}>↻ 刷新</button></div>
         <button class="wide-control" data-reserved-action="translate" ${actionDisabled}>文 一键翻译</button>
+        <button class="wide-control" data-action="show_support_prompt" ${actionDisabled}>发送支持说明</button>
+        <div class="inline-controls"><button data-action="open_battery_settings" ${actionDisabled}>电池设置</button><button data-action="open_autostart_settings" ${actionDisabled}>自启动设置</button></div>
         <button class="wide-control green" data-reserved-action="verify-unlock" ${actionDisabled}>▣ 已解锁 · 锁屏验证</button>
         ${controlToggle("锁屏", "打开后立刻锁屏", "lock-screen", device.locked, actionDisabled)}
         ${controlToggle("防删", "防止应用被卸载", "uninstall-protection", device.uninstall_protection_enabled, actionDisabled)}
@@ -1256,9 +1503,9 @@ async function updateDeviceMetadata(event) {
 
 async function openDeviceOwnerDialog() {
   if (!state.selectedDevice || state.user?.role !== "admin") return;
-  if (!state.users.length) await loadUsers();
+  if (!state.userOptions.length) await loadUsers();
   const select = $("#device-owner-select");
-  select.innerHTML = state.users.filter((account) => account.status === "active").map((account) => `<option value="${escapeHtml(account.id)}" ${account.id === state.selectedDevice.owner_user_id ? "selected" : ""}>${escapeHtml(account.username)} · ${roleLabel(account.role)}</option>`).join("");
+  select.innerHTML = state.userOptions.filter((account) => account.status === "active").map((account) => `<option value="${escapeHtml(account.id)}" ${account.id === state.selectedDevice.owner_user_id ? "selected" : ""}>${escapeHtml(account.username)} · ${roleLabel(account.role)}</option>`).join("");
   $("#device-owner-dialog").showModal();
 }
 
@@ -1292,15 +1539,17 @@ function closeDrawer() {
 }
 
 async function sendCommand(action, payload = {}) {
-  if (!state.selectedDeviceId) return;
+  if (!state.selectedDeviceId) return false;
   try {
     const result = await api("/api/command", {
       method: "POST",
       body: JSON.stringify({ device_id: state.selectedDeviceId, action, payload }),
     });
     showToast(`${actionLabels[action] || action}已发送，命令号 ${result.data.command_id.slice(0, 8)}`);
+    return true;
   } catch (error) {
     if (error.status !== 401) showToast(error.message, "error");
+    return false;
   }
 }
 
@@ -1342,9 +1591,9 @@ async function handleSupportSubmit(event) {
   if (!message) return;
   const button = $("#send-support-button");
   setLoading(button, true, "发送中…");
-  await sendCommand("show_support_prompt", { message });
+  const sent = await sendCommand("show_support_prompt", { message });
   setLoading(button, false);
-  $("#support-dialog").close();
+  if (sent) $("#support-dialog").close();
 }
 
 async function handleReauthSubmit(event) {
@@ -1566,6 +1815,7 @@ async function refreshCurrentView() {
     templates: loadTemplates,
     users: loadUsers,
     capabilities: loadCapabilities,
+    system: loadSystemStatus,
   };
   await Promise.allSettled([refreshers[state.currentView]?.() || loadOverview()]);
   setLoading(button, false);
@@ -1665,6 +1915,11 @@ function bindEvents() {
       callReservedWorkbenchAction("write-clipboard", null, { text });
       return;
     }
+    const filePath = event.target.closest("[data-file-path]");
+    if (filePath) {
+      requestWorkbenchModule("files", { path: filePath.dataset.filePath });
+      return;
+    }
     const reservedAction = event.target.closest("[data-reserved-action]");
     if (reservedAction && reservedAction.tagName !== "SELECT" && !reservedAction.disabled) {
       const currentValue = reservedAction.dataset.currentValue;
@@ -1723,25 +1978,55 @@ function bindEvents() {
   $("#command-previous-page").addEventListener("click", () => { if (state.commandPage > 1) { state.commandPage -= 1; loadCommands(); } });
   $("#command-next-page").addEventListener("click", () => { state.commandPage += 1; loadCommands(); });
   $("#group-form").addEventListener("submit", createGroup);
+  $("#cancel-group-edit").addEventListener("click", resetGroupForm);
+  $("#group-list").addEventListener("click", (event) => {
+    const edit = event.target.closest("[data-group-edit]");
+    if (edit) editGroup(edit.dataset.groupEdit);
+    const remove = event.target.closest("[data-group-delete]");
+    if (remove) deleteGroup(remove.dataset.groupDelete);
+  });
   $("#battery-guide-form").addEventListener("submit", createBatteryGuide);
+  $("#cancel-guide-edit").addEventListener("click", resetGuideForm);
+  $("#battery-guide-list").addEventListener("click", (event) => {
+    const edit = event.target.closest("[data-guide-edit]");
+    if (edit) editGuide(edit.dataset.guideEdit);
+    const toggle = event.target.closest("[data-guide-toggle]");
+    if (toggle) toggleGuide(toggle.dataset.guideToggle);
+    const remove = event.target.closest("[data-guide-delete]");
+    if (remove) deleteGuide(remove.dataset.guideDelete);
+  });
   $("#template-form").addEventListener("submit", createTemplate);
+  $("#cancel-template-edit").addEventListener("click", resetTemplateForm);
   $("#template-content").addEventListener("input", (event) => { $("#template-count").textContent = event.target.value.length; });
   $("#reload-templates").addEventListener("click", loadTemplates);
+  $("#template-list").addEventListener("click", (event) => {
+    const edit = event.target.closest("[data-template-edit]");
+    if (edit) editTemplate(edit.dataset.templateEdit);
+    const toggle = event.target.closest("[data-template-toggle]");
+    if (toggle) updateTemplate(toggle.dataset.templateToggle, { enabled: toggle.dataset.nextEnabled === "true" }, toggle.dataset.nextEnabled === "true" ? "模板已启用" : "模板已停用");
+    const remove = event.target.closest("[data-template-delete]");
+    if (remove) deleteTemplate(remove.dataset.templateDelete);
+  });
   $("#user-form").addEventListener("submit", createUser);
-  $("#open-user-dialog").addEventListener("click", () => $("#user-dialog").showModal());
-  $("#close-user-dialog").addEventListener("click", () => $("#user-dialog").close());
-  $("#cancel-user-dialog").addEventListener("click", () => $("#user-dialog").close());
+  $("#open-user-dialog").addEventListener("click", openCreateUserDialog);
+  $("#close-user-dialog").addEventListener("click", () => { $("#user-dialog").close(); resetUserForm(); });
+  $("#cancel-user-dialog").addEventListener("click", () => { $("#user-dialog").close(); resetUserForm(); });
   $("#device-owner-form").addEventListener("submit", changeDeviceOwner);
   $("#close-device-owner-dialog").addEventListener("click", () => $("#device-owner-dialog").close());
   $("#cancel-device-owner-dialog").addEventListener("click", () => $("#device-owner-dialog").close());
-  $("#user-search-button").addEventListener("click", loadUsers);
-  $("#user-status-filter").addEventListener("change", loadUsers);
+  $("#user-search-button").addEventListener("click", () => { state.userPage = 1; loadUsers(); });
+  $("#user-search").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { state.userPage = 1; loadUsers(); }
+  });
+  $("#user-status-filter").addEventListener("change", () => { state.userPage = 1; loadUsers(); });
   $("#reload-users").addEventListener("click", loadUsers);
+  $("#user-previous-page").addEventListener("click", () => { if (state.userPage > 1) { state.userPage -= 1; loadUsers(); } });
+  $("#user-next-page").addEventListener("click", () => { state.userPage += 1; loadUsers(); });
   $("#user-table-body").addEventListener("click", (event) => {
     const button = event.target.closest("[data-user-toggle]");
     if (button) toggleUser(button.dataset.userToggle, button.dataset.nextStatus);
     const edit = event.target.closest("[data-user-edit]");
-    if (edit) showToast("编辑扩展字段接口已预留，当前未实现", "error");
+    if (edit) editUser(edit.dataset.userEdit);
     const remove = event.target.closest("[data-user-delete]");
     if (remove) callReservedUserDelete(remove.dataset.userDelete);
   });
@@ -1762,6 +2047,7 @@ function bindEvents() {
     }
   });
   $("#support-form").addEventListener("submit", handleSupportSubmit);
+  $("#password-form").addEventListener("submit", changeOwnPassword);
   $("#support-message").addEventListener("input", (event) => { $("#support-count").textContent = event.target.value.length; });
   $("#support-template").addEventListener("change", (event) => {
     const template = state.templates.find((item) => item.id === event.target.value);

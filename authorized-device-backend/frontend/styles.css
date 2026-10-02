@@ -267,7 +267,7 @@ input:focus, select:focus, textarea:focus { border-color: #77b2f5; background: #
 .management-panel > .stack-form { padding: 0 20px 18px; border-bottom: 1px solid var(--line); }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
 .management-list { max-height: 390px; overflow-y: auto; padding: 8px 20px 18px; }
-.management-item { display: grid; grid-template-columns: 1fr auto; gap: 12px; padding: 13px 2px; border-bottom: 1px solid #edf0f4; }
+.management-item { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 12px; padding: 13px 2px; border-bottom: 1px solid #edf0f4; }
 .management-item:last-child { border-bottom: 0; }
 .management-item h4 { margin: 0 0 5px; font-size: 11px; }
 .management-item p { margin: 0; color: #8893a4; font-size: 9px; line-height: 1.55; }
@@ -294,6 +294,12 @@ input:focus, select:focus, textarea:focus { border-color: #77b2f5; background: #
 .template-item p { margin: 0; color: #65738a; font-size: 10px; line-height: 1.7; }
 .template-item small { display: block; margin-top: 12px; color: #9aa3b1; font-size: 8px; }
 .template-item .capability-status { position: absolute; top: 13px; right: 13px; }
+.row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.row-actions button { min-height: 30px; padding: 0 9px; border: 1px solid #dbe3eb; border-radius: 7px; color: #45627e; background: #fff; font-size: 9px; }
+.row-actions button.danger { color: #c94a58; border-color: #f0d5d8; }
+.template-item .row-actions { margin-top: 12px; }
+.multiline-cell { max-width: 220px; white-space: pre-line; overflow-wrap: anywhere; }
+.password-panel { margin-top: 16px; }
 
 .metadata-form { display: grid; gap: 8px; }
 .metadata-form select, .metadata-form input { height: 38px; font-size: 10px; }
@@ -537,6 +543,7 @@ input:focus, select:focus, textarea:focus { border-color: #77b2f5; background: #
 .app-card span { color: #9aa4b2; }
 .app-card-actions { display: flex; gap: 5px; }
 .app-card-actions button, .contact-list button, .module-table button, .clipboard-panel button { min-height: 30px; padding: 0 9px; border: 1px solid #dbe3eb; border-radius: 7px; background: #fff; }
+.module-link { display: inline-flex; min-height: 30px; align-items: center; padding: 0 9px; border: 1px solid #dbe3eb; border-radius: 7px; color: var(--blue); background: #fff; text-decoration: none; }
 .app-card-actions button.danger { color: #c94a58; }
 .permission-summary { display: flex; gap: 8px; margin: 10px 0; }
 .permission-summary > * { padding: 7px 10px; border-radius: 8px; background: #f0f4f8; }

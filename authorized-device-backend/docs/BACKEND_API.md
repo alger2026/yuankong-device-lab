@@ -16,19 +16,21 @@
 | 方法 | 路径 | 作用 |
 |---|---|---|
 | GET | `/api/health` | 健康状态 |
-| POST | `/api/login` | 登录并返回 Bearer token |
+| POST | `/api/login` | 登录并返回 Bearer token；账号启用 TOTP 或 IP 白名单时同时校验 |
 | GET | `/api/me` | 当前用户 |
 | POST | `/api/logout` | 撤销当前会话 |
 | POST | `/api/auth/reauth` | 刷新敏感操作验证时间 |
 | POST | `/api/auth/password` | 修改自己的密码并撤销其他会话 |
-| GET/POST/PATCH | `/api/users`、`/api/users/{id}` | 账号列表、新增、角色、状态和密码重置 |
-| PATCH/DELETE | `/api/users/{id}/settings`、`/api/users/{id}` | 管理员扩展字段与删除占位，返回 501 |
+| GET/POST/PATCH/DELETE | `/api/users`、`/api/users/{id}` | 账号分页、新增、编辑、软删除、角色、状态和密码重置 |
+| GET | `/api/user-options` | 设备归属选择所需的完整账号选项 |
+| PATCH | `/api/users/{id}/settings` | 更新 TOTP、IP 白名单和备注 |
 | GET | `/api/roles` | 查询角色及其权限说明 |
 | POST | `/api/ws-ticket` | Dashboard WS 一次性票据 |
 | GET | `/api/capabilities` | 查询已实现、未实现和不能提供的功能清单 |
-| GET/POST/PATCH | `/api/device-groups` | 设备分组列表、新增和修改 |
-| GET/POST/PUT | `/api/battery-config`、`/api/battery-guides` | 获取和维护品牌/型号设置说明 |
-| GET/POST/PATCH | `/api/message-templates` | 维护用户可见的支持说明模板 |
+| GET/POST/PATCH/DELETE | `/api/device-groups` | 设备分组列表、新增、修改和删除 |
+| GET/POST/PUT/DELETE | `/api/battery-config`、`/api/battery-guides` | 获取和维护品牌/型号设置说明 |
+| GET/POST/PATCH/DELETE | `/api/message-templates` | 维护用户可见的支持说明模板 |
+| GET | `/api/system/status` | API、数据库、设备通道和 Dashboard 实时连接状态 |
 | GET | `/api/overview` | 总设备、在线、离线 |
 | GET | `/api/devices` | 搜索、权限状态筛选和分页 |
 | GET | `/api/devices/{id}` | 设备详情 |
@@ -67,7 +69,7 @@
 
 | 接口 | 关键输入 | 主要输出或行为 |
 |---|---|---|
-| `POST /api/login` | `username`、`password` | Bearer token、有效期和用户角色 |
+| `POST /api/login` | `username`、`password`、可选 `otp_code` | 校验账号状态、IP 白名单和 TOTP 后返回 Bearer token、有效期和用户角色 |
 | `GET /api/me` | Bearer token | 当前用户 ID、用户名、角色 |
 | `POST /api/logout` | Bearer token | 撤销当前会话 |
 | `POST /api/auth/reauth` | 当前密码 | 把当前会话标记为最近已二次验证 |

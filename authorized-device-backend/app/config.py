@@ -23,6 +23,7 @@ class Settings:
     device_offline_after_seconds: int
     enable_device_lock: bool
     legacy_device_aes_key: str = "0623U25KTT3YO8P9"
+    heartbeat_offline_after_seconds: int = 900
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -37,5 +38,8 @@ class Settings:
             enable_device_lock=_bool_env("ADB_ENABLE_DEVICE_LOCK", False),
             legacy_device_aes_key=os.getenv(
                 "ADB_LEGACY_DEVICE_AES_KEY", "0623U25KTT3YO8P9"
+            ),
+            heartbeat_offline_after_seconds=int(
+                os.getenv("ADB_HEARTBEAT_OFFLINE_SECONDS", "900")
             ),
         )

